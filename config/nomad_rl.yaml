@@ -1,0 +1,60 @@
+scene_names:
+  - FloorPlan1
+  # - FloorPlan2
+  # - FloorPlan3
+  # - FloorPlan4
+  # - FloorPlan5
+  # - FloorPlan201
+  # - FloorPlan202
+  # - FloorPlan203
+  # - FloorPlan204
+  # - FloorPlan205
+  # - FloorPlan301
+  # - FloorPlan302
+  # - FloorPlan303
+  # - FloorPlan304
+  # - FloorPlan305
+
+image_size: [96, 96]
+max_episode_steps: 500
+success_distance: 1.0
+context_size: 5
+goal_prob: 0.5
+
+encoding_size: 256
+mha_num_attention_heads: 4
+mha_num_attention_layers: 4
+mha_ff_dim_factor: 4
+hidden_dim: 512
+
+pretrained_vision_encoder: null  # Nomad Check Point
+freeze_vision_encoder: false    # Whether to freeze vision encoder during training
+
+# Training Parameters
+total_timesteps: 1000000
+rollout_steps: 2048
+buffer_size: 2048
+batch_size: 64
+ppo_epochs: 10
+# learning_rate: 1e-4 
+
+gamma: 0.99          # Discount factor
+lam: 0.95           # GAE lambda
+clip_ratio: 0.2     # PPO clipping ratio
+entropy_coef: 0.01  # Entropy coefficient
+value_coef: 0.5     # Value function coefficient
+distance_coef: 0.1  # Distance prediction coefficient
+max_grad_norm: 0.5  # Gradient clipping
+
+learning_rate: 1e-3
+device: cuda
+log_freq: 10     
+save_freq: 50      
+save_dir: ./checkpoints/nomad_rl
+
+use_wandb: true
+wandb_project: nomad-rl-ai2thor
+run_name: nomad_rl_experiment_1
+
+eval_episodes: 10
+eval_freq: 100
