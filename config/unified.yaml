@@ -1,0 +1,77 @@
+# config/unified_training.yaml
+
+# Dataset will be specified via command line
+dataset: null  # 'ithor' or 'robothor'
+
+# Environment settings
+image_size: [224, 224]
+max_episode_steps: 500
+success_distance: 1.0
+context_size: 5
+goal_prob: 0.5
+eval_goal_prob: 1.0  # Always goal-conditioned for evaluation
+
+# Model Architecture
+encoding_size: 256
+mha_num_attention_heads: 4
+mha_num_attention_layers: 4
+mha_ff_dim_factor: 4
+hidden_dim: 512
+lstm_hidden_size: 256
+lstm_num_layers: 2
+
+# Two-Stage Training
+training_stage: 1  # Set via command line
+stage1_timesteps: 1000000  # 1M steps
+stage2_timesteps: 2000000  # 2M steps
+
+# Stage-specific parameters
+stage1_learning_rate: 0.001
+stage2_learning_rate: 0.0001
+
+# Reward Components
+success_reward: 100.0
+distance_weight: 20.0
+step_penalty: 0.005
+collision_penalty: 1.0
+exploration_bonus: 5.0
+curiosity_weight: 0.1
+
+# Curriculum Learning
+curriculum_success_threshold: 0.7
+curriculum_window_size: 100
+
+# Training Parameters
+rollout_steps: 512
+buffer_size: 512
+batch_size: 16
+ppo_epochs: 4
+
+# PPO Parameters
+gamma: 0.99
+lam: 0.95
+clip_ratio: 0.2
+entropy_coef: 0.01
+value_coef: 0.5
+distance_coef: 0.1
+auxiliary_coef: 0.1
+max_grad_norm: 0.5
+
+# Performance
+use_amp: true
+device: cuda
+
+# Evaluation Settings
+eval_episodes: 20  # Quick evaluation during training
+val_freq: 100      # Validate every N updates
+eval_freq: 100     # Compatibility
+
+# Logging and Saving
+log_freq: 10
+save_freq: 50
+save_dir: ./checkpoints/unified
+
+# Weights & Biases
+use_wandb: true
+wandb_project: nomad-rl-unified
+run_name: unified_training
