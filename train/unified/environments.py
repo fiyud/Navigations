@@ -11,8 +11,6 @@ import gym
 from gym import spaces
 
 class EnhancedAI2ThorEnv(gym.Env):
-    """Enhanced environment that can handle both iTHOR and RoboTHOR scenes"""
-    
     def __init__(
         self,
         scene_names: List[str] = None,
@@ -72,7 +70,6 @@ class EnhancedAI2ThorEnv(gym.Env):
         self.initial_position = None
         self.visited_positions = set()
         self.position_visit_counts = {}
-        self.object_positions = {}
         
     def _is_robothor_scene(self, scene_name: str) -> bool:
         """Check if a scene is from RoboTHOR"""
@@ -85,15 +82,12 @@ class EnhancedAI2ThorEnv(gym.Env):
         
         is_robothor = self._is_robothor_scene(scene_name)
         
-        # Check if we need to switch controller type
         if self.controller is not None and self.current_dataset_type == is_robothor:
-            return  # No need to reinitialize
+            return
         
-        # Close existing controller
         if self.controller is not None:
             self.controller.stop()
         
-        # Create new controller with appropriate settings
         if is_robothor:
             print(f"Initializing RoboTHOR controller for scene: {scene_name}")
             self.controller = Controller(
@@ -112,7 +106,7 @@ class EnhancedAI2ThorEnv(gym.Env):
         else:
             print(f"Initializing iTHOR controller for scene: {scene_name}")
             self.controller = Controller(
-                agentMode="default",
+                agentMode="locobot",
                 scene=scene_name,
                 gridSize=0.25,
                 snapToGrid=True,
@@ -129,15 +123,11 @@ class EnhancedAI2ThorEnv(gym.Env):
         self.current_scene = scene_name
     
     def reset(self) -> Dict[str, np.ndarray]:
-        """Reset environment, handling both iTHOR and RoboTHOR scenes"""
-        # Choose a random scene
         scene_name = random.choice(self.scene_names)
         
-        # Initialize controller if needed
         if self.current_scene != scene_name or self.controller is None:
             self._initialize_controller(scene_name)
             self.controller.reset(scene=scene_name)
-            self._cache_object_positions()
         
         # Get reachable positions
         try:
@@ -154,7 +144,6 @@ class EnhancedAI2ThorEnv(gym.Env):
                 rotation=dict(x=0, y=random.choice([0, 90, 180, 270]), z=0)
             )
         
-        # Reset episode variables
         self.current_step = 0
         self.context_buffer = []
         self.visited_positions = set()
@@ -170,10 +159,9 @@ class EnhancedAI2ThorEnv(gym.Env):
             self.goal_position = None
             self.goal_image = None
         
-        # Get initial observation
+        # Get init observation
         obs = self._get_observation()
         
-        # Initialize context buffer
         for _ in range(self.context_size):
             self.context_buffer.append(obs['rgb'])
         
@@ -206,13 +194,11 @@ class EnhancedAI2ThorEnv(gym.Env):
             if event.metadata['lastActionSuccess']:
                 reachable.append(pos)
         
-        # Teleport back to original position
         self.controller.step(action="Teleport", position=current_pos)
         
         return reachable if reachable else [current_pos]
     
     def step(self, action: int) -> Tuple[Dict[str, np.ndarray], float, bool, Dict[str, Any]]:
-        """Execute action in environment"""
         action_map = {
             0: "MoveAhead",
             1: "MoveBack",
@@ -220,7 +206,6 @@ class EnhancedAI2ThorEnv(gym.Env):
             3: "RotateRight",
         }
         
-        # Execute action
         event = self.controller.step(action=action_map[action])
         self.current_step += 1
         
@@ -232,11 +217,9 @@ class EnhancedAI2ThorEnv(gym.Env):
         if len(self.context_buffer) > self.context_size:
             self.context_buffer.pop(0)
         
-        # Calculate reward
         reward = self._calculate_reward(event, obs)
         done = self._is_done(obs)
         
-        # Create info dict
         info = {
             'success': self._is_success(obs),
             'collision': not event.metadata['lastActionSuccess'],
@@ -293,7 +276,6 @@ class EnhancedAI2ThorEnv(gym.Env):
         }
     
     def _set_random_goal(self):
-        """Set a random goal position"""
         try:
             reachable_positions = self.controller.step(action="GetReachablePositions").metadata["actionReturn"]
         except:
@@ -302,7 +284,6 @@ class EnhancedAI2ThorEnv(gym.Env):
         if reachable_positions:
             current_pos = self._get_agent_position()
             
-            # Filter positions by distance
             valid_goals = [
                 pos for pos in reachable_positions
                 if self._calculate_distance(current_pos, pos) > 2.0
@@ -330,7 +311,6 @@ class EnhancedAI2ThorEnv(gym.Env):
                 )
     
     def _calculate_reward(self, event, obs) -> float:
-        """Calculate reward"""
         reward = 0.0
         reward -= 0.005  # Step penalty
         
@@ -402,7 +382,7 @@ class EnhancedAI2ThorEnv(gym.Env):
         })
     
     def _get_agent_position(self) -> Dict[str, float]:
-        """Get agent's current position"""
+        """Get agent current position"""
         return self.controller.last_event.metadata['agent']['position']
     
     def _calculate_distance(self, pos1, pos2) -> float:
@@ -411,23 +391,12 @@ class EnhancedAI2ThorEnv(gym.Env):
             (pos1['x'] - pos2['x'])**2 +
             (pos1['z'] - pos2['z'])**2
         )
-    
-    def _cache_object_positions(self):
-        """Cache positions of important objects"""
-        event = self.controller.last_event
-        self.object_positions = {}
-        
-        for obj in event.metadata.get('objects', []):
-            if obj.get('pickupable', False) or obj.get('objectType', '') in ['Television', 'Microwave', 'Fridge']:
-                self.object_positions[obj['objectId']] = obj.get('position', {})
-    
+
     def close(self):
-        """Close the environment"""
         if self.controller:
             self.controller.stop()
     
     def render(self, mode='human'):
-        """Render the environment"""
         if mode == 'human':
             event = self.controller.last_event
             return np.array(event.frame)
