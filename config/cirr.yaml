@@ -1,13 +1,13 @@
 dataset: combined # 'ithor', 'robothor', or 'combined'
 
 image_size: [224, 224]
-max_episode_steps: 500  # Will be overridden by curriculum
+max_episode_steps: 500
 success_distance: 1.0
 context_size: 5
-goal_prob: 0.5  # Will be overridden by curriculum
+goal_prob: 0.5
 eval_goal_prob: 1.0  # Always goal-conditioned for evaluation
 
-# Model Architecture
+
 encoding_size: 256
 mha_num_attention_heads: 4
 mha_num_attention_layers: 4
@@ -27,7 +27,9 @@ training_stage: 1  # Set via command line
 stage1_timesteps: 1000000  # 1M steps
 stage2_timesteps: 2000000  # 2M steps
 
-# Stage params
+learning_rate: 0.0003  
+value_clip: 10.0
+
 stage1_learning_rate: 0.001
 stage2_learning_rate: 0.0001
 
@@ -40,16 +42,16 @@ exploration_bonus: 5.0
 curiosity_weight: 0.1
 
 # Training Params
-rollout_steps: 512
+rollout_steps: 1024
 buffer_size: 512
-batch_size: 16
-ppo_epochs: 4
+batch_size: 32
+ppo_epochs: 3
 
 # PPO Params
 gamma: 0.99
 lam: 0.95
 clip_ratio: 0.2
-entropy_coef: 0.01
+entropy_coef: 0.1
 value_coef: 0.5
 distance_coef: 0.1
 auxiliary_coef: 0.1
@@ -58,7 +60,6 @@ max_grad_norm: 0.5
 use_amp: true
 device: cuda
 
-# Eval Settings
 eval_episodes: 20
 val_freq: 100
 eval_freq: 100

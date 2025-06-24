@@ -11,17 +11,20 @@ from collections import defaultdict
 from typing import Dict, List, Tuple, Optional
 import time
 from datetime import datetime
+from torch.cuda.amp import autocast, GradScaler
 
 import sys
 sys.path.append(r'/home/tuandang/tuandang/quanganh/visualnav-transformer/train')
 
-from nomad_rl.environments.enhanced_ai2thor_env import EnhancedAI2ThorEnv
-from nomad_rl.models.enhanced_nomad_rl_model import (
+from Unified.env import EnhancedAI2ThorEnv
+from TwoStage.nomad_model import (
     EnhancedNoMaDRL, MultiComponentRewardCalculator, 
-    EvaluationMetrics, prepare_observation
+    CurriculumManager, EvaluationMetrics, prepare_observation
 )
-from nomad_rl.training.two_stage_trainer import TwoStageTrainer
-from nomad_rl.training.enhanced_curriculum_manager import EnhancedCurriculumManager
+from TwoStage.two_stage_train import TwoStageTrainer
+
+sys.path.append(r'/home/tuandang/tuandang/quanganh/visualnav-transformer/train/Cirr')
+from Cirr import EnhancedCurriculumManager
 
 class UnifiedTrainerWithCurriculum(TwoStageTrainer):
     def __init__(self, config: Dict):
@@ -41,21 +44,22 @@ class UnifiedTrainerWithCurriculum(TwoStageTrainer):
         
         super().__init__(config)
         
-        # Override reward calculator to use curriculum-adjusted penalties
         self.reward_calculator = self._create_curriculum_reward_calculator(config)
         
-        # Create validation and test environments
-        self.val_env = self._create_environment(
-            self.splits['val'], 
-            config, 
-            goal_prob=config.get('eval_goal_prob', 1.0)
-        )
+        self.val_scenes = self.splits['val']
+        self.test_scenes = self.splits['test']
+
+        # self.val_env = self._create_environment(
+        #     self.splits['val'], 
+        #     config, 
+        #     goal_prob=config.get('eval_goal_prob', 1.0)
+        # )
         
-        self.test_env = self._create_environment(
-            self.splits['test'], 
-            config, 
-            goal_prob=config.get('eval_goal_prob', 1.0)
-        )
+        # self.test_env = self._create_environment(
+        #     self.splits['test'], 
+        #     config, 
+        #     goal_prob=config.get('eval_goal_prob', 1.0)
+        # )
         
         self.results = {
             'train': defaultdict(list),
@@ -196,10 +200,10 @@ class UnifiedTrainerWithCurriculum(TwoStageTrainer):
                 self.success_rates.append(1.0 if episode_success else 0.0)
                 
                 self.curriculum_manager.update(
-                    episode_success, 
-                    episode_length,
-                    episode_collisions
-                )
+                episode_success=episode_success,
+                episode_length=episode_length,
+                collision_count=episode_collisions
+            )
                 
                 # Update evaluation metrics
                 agent_pos = self.env._get_agent_position()
@@ -240,6 +244,119 @@ class UnifiedTrainerWithCurriculum(TwoStageTrainer):
         
         return rollout_stats
     
+    def _evaluate_on_split(self, split_name: str, env=None, num_episodes: Optional[int] = None) -> Dict[str, float]:
+        """Evaluate using the same environment instance"""
+        if num_episodes is None:
+            num_episodes = self.config.get('eval_episodes', 20)
+        
+        print(f"\nEvaluating on {split_name} split ({num_episodes} episodes)...")
+        
+        # Save current environment state
+        original_scenes = self.env.scene_names
+        original_goal_prob = self.env.goal_prob
+        
+        # Switch to evaluation scenes
+        if split_name == 'val':
+            self.env.scene_names = self.val_scenes
+        elif split_name == 'test':
+            self.env.scene_names = self.test_scenes
+        elif split_name == 'train':
+            self.env.scene_names = self.splits['train']  # Use full training set
+        
+        # Set evaluation goal probability
+        self.env.goal_prob = self.config.get('eval_goal_prob', 1.0)
+        
+        # Run evaluation
+        self.model.eval()
+        
+        metrics = EvaluationMetrics()
+        episode_rewards = []
+        episode_lengths = []
+        episode_successes = []
+        episode_collisions = []
+        
+        for episode_idx in range(num_episodes):
+            obs = self.env.reset()
+            torch_obs = prepare_observation(obs, self.device)
+            
+            if hasattr(self.model, 'reset_hidden'):
+                self.model.reset_hidden()
+            hidden_state = None
+            
+            episode_reward = 0
+            episode_length = 0
+            collision_count = 0
+            
+            while episode_length < self.config['max_episode_steps']:
+                with torch.no_grad():
+                    if hasattr(self.model, 'get_action'):
+                        action, _, hidden_state = self.model.get_action(
+                            torch_obs, deterministic=True, hidden_state=hidden_state
+                        )
+                    else:
+                        outputs = self.model.forward(torch_obs, mode="policy")
+                        action_dist = outputs['action_dist']
+                        action = action_dist.probs.argmax(dim=-1)
+                
+                next_obs, _, done, info = self.env.step(action.cpu().item())
+                
+                # Calculate reward
+                event = self.env.controller.last_event
+                reward = self.reward_calculator.calculate_reward(event, next_obs, info, self.env)
+                
+                episode_reward += reward
+                episode_length += 1
+                
+                if info.get('collision', False):
+                    collision_count += 1
+                
+                # Track metrics
+                agent_pos = self.env._get_agent_position()
+                pos_key = (round(agent_pos['x'], 1), round(agent_pos['z'], 1))
+                metrics.step(info, reward, pos_key)
+                
+                if done:
+                    break
+                
+                torch_obs = prepare_observation(next_obs, self.device)
+            
+            # Record episode results
+            episode_success = info.get('success', False)
+            episode_rewards.append(episode_reward)
+            episode_lengths.append(episode_length)
+            episode_successes.append(episode_success)
+            episode_collisions.append(collision_count)
+            metrics.end_episode(episode_success)
+            
+            if (episode_idx + 1) % 10 == 0:
+                current_sr = sum(episode_successes) / len(episode_successes)
+                print(f"  Completed {episode_idx + 1}/{num_episodes} episodes (SR: {current_sr:.2%})")
+        
+        # Restore original environment state
+        self.env.scene_names = original_scenes
+        self.env.goal_prob = original_goal_prob
+        self.model.train()
+        
+        # Compute metrics
+        eval_metrics = metrics.compute_metrics()
+        eval_metrics.update({
+            'avg_reward': np.mean(episode_rewards),
+            'std_reward': np.std(episode_rewards),
+            'avg_length': np.mean(episode_lengths),
+            'std_length': np.std(episode_lengths),
+            'success_rate': np.mean(episode_successes),
+            'avg_collisions': np.mean(episode_collisions),
+            'num_episodes': num_episodes
+        })
+        
+        # Print summary
+        print(f"\n{split_name.upper()} Results:")
+        print(f"  Success Rate: {eval_metrics['success_rate']:.2%}")
+        print(f"  Avg Reward: {eval_metrics['avg_reward']:.2f}")
+        print(f"  Avg Length: {eval_metrics['avg_length']:.1f}")
+        
+        return eval_metrics
+
     def train_val_test(self, total_timesteps: int):
         print(f"Starting unified training with curriculum learning for {total_timesteps} timesteps...")
         print(f"Dataset: {self.dataset}")
@@ -250,11 +367,9 @@ class UnifiedTrainerWithCurriculum(TwoStageTrainer):
         update_count = 0
         
         while timesteps_collected < total_timesteps:
-            # Check if curriculum should be updated
             if update_count > 0 and update_count % self.curriculum_update_freq == 0:
                 old_level = self.curriculum_manager.current_level
                 
-                # Check if curriculum has changed
                 if self.curriculum_manager.current_level != old_level:
                     self._update_environment_curriculum()
                     self.last_curriculum_update = update_count
@@ -274,7 +389,6 @@ class UnifiedTrainerWithCurriculum(TwoStageTrainer):
                     timesteps_collected, rollout_stats, update_stats
                 )
                 
-                # Record curriculum progress
                 curriculum_stats = self.curriculum_manager.get_progress_stats()
                 self.results['curriculum']['timesteps'].append(timesteps_collected)
                 self.results['curriculum']['level'].append(curriculum_stats['current_level'])
@@ -477,9 +591,9 @@ class UnifiedTrainerWithCurriculum(TwoStageTrainer):
         dataset = config['dataset']
         
         if dataset == 'combined':
-            splits_file = config.get('splits_file', './config/splits/combined_splits.yaml')
+            splits_file = config.get('splits_file', '/home/tuandang/tuandang/quanganh/visualnav-transformer/train/Unified/config/splits/combined_splits.yaml')
         else:
-            splits_file = config.get('splits_file', f'./config/splits/{dataset}_splits.yaml')
+            splits_file = config.get('splits_file', f'/home/tuandang/tuandang/quanganh/visualnav-transformer/train/Unified/config/splits/{dataset}_splits.yaml')
         
         if os.path.exists(splits_file):
             with open(splits_file, 'r') as f:
@@ -487,12 +601,12 @@ class UnifiedTrainerWithCurriculum(TwoStageTrainer):
             print(f"Loaded splits from {splits_file}")
         else:
             if dataset == 'combined':
-                from combined_dataset_splits import CombinedAI2THORDatasetSplitter
+                from Unified.datasplit import CombinedAI2THORDatasetSplitter
                 splitter = CombinedAI2THORDatasetSplitter()
                 splits_dict = splitter.save_combined_splits()
                 splits = {k: v['combined'] for k, v in splits_dict.items()}
             else:
-                from dataset_splits import AI2THORDatasetSplitter
+                from TwoStage.datasplit import AI2THORDatasetSplitter
                 splitter = AI2THORDatasetSplitter()
                 splits = splitter.save_splits(dataset)
         
@@ -529,7 +643,7 @@ class UnifiedTrainerWithCurriculum(TwoStageTrainer):
 
 def main():
     parser = argparse.ArgumentParser(description='Unified Train/Val/Test with Curriculum Learning')
-    parser.add_argument('--config', type=str, required=True,
+    parser.add_argument('--config', type=str, required=False, default="/home/tuandang/tuandang/quanganh/visualnav-transformer/train/config/cirr.yaml",
                        help='Path to config file')
     parser.add_argument('--dataset', type=str, choices=['ithor', 'robothor', 'combined'],
                        required=True, help='Dataset to use')
@@ -583,3 +697,5 @@ def main():
 
 if __name__ == '__main__':
     main()
+
+

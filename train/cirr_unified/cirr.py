@@ -45,11 +45,11 @@ class EnhancedCurriculumManager:
                 {
                     'name': 'Basic Navigation',
                     'room_types': ['kitchen'],
-                    'num_scenes': 5,
-                    'max_distance': 3.0,
-                    'max_episode_steps': 100,
-                    'goal_prob': 0.8,
-                    'collision_penalty_multiplier': 0.5,
+                    'num_scenes': 3,
+                    'max_distance': 2.0,
+                    'max_episode_steps': 150,
+                    'goal_prob': 0.9,
+                    'collision_penalty_multiplier': 0.2,
                     'use_robothor': False
                 },
                 
@@ -333,7 +333,6 @@ class EnhancedCurriculumManager:
         return success_rate < 0.3 and self.episodes_at_level > self.min_episodes * 2
     
     def advance_level(self):
-        """Move to next diff level"""
         if self.current_level < len(self.levels) - 1:
             self.current_level += 1
             self.episodes_at_level = 0
@@ -351,7 +350,6 @@ class EnhancedCurriculumManager:
             print(f"{'='*50}\n")
     
     def decrease_level(self):
-        """Reduce difficulty level"""
         if self.current_level > 0:
             self.current_level -= 1
             self.episodes_at_level = 0

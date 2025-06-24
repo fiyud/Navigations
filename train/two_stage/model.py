@@ -82,53 +82,121 @@ class EnhancedNoMaDRL(nn.Module):
         
         self.hidden_state = None
         
+        for param in self.lstm.parameters():
+            param.register_hook(lambda grad: torch.clamp(grad, -1, 1))
+
     def forward(self, observations: Dict[str, torch.Tensor], mode: str = "policy", 
                 hidden_state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None):
         obs_img = observations['context']
         goal_img = observations['goal_rgb']
         goal_mask = observations['goal_mask']
         
+        # Input validation
+        for key, value in observations.items():
+            if torch.isnan(value).any() or torch.isinf(value).any():
+                print(f"WARNING: Invalid values in input {key}")
+                observations[key] = torch.nan_to_num(value, nan=0.0, posinf=1.0, neginf=-1.0)
+        
         last_obs_frame = obs_img[:, -3:, :, :]
         obsgoal_img = torch.cat([last_obs_frame, goal_img], dim=1)
         
-        vision_features = self.vision_encoder(
-            obs_img=obs_img,
-            goal_img=obsgoal_img,
-            input_goal_mask=goal_mask.long().squeeze(-1)
-        )
+        try:
+            # Get vision features with error handling
+            vision_features = self.vision_encoder(
+                obs_img=obs_img,
+                goal_img=obsgoal_img,
+                input_goal_mask=goal_mask.long().squeeze(-1)
+            )
+        except Exception as e:
+            print(f"Error in vision encoder: {e}")
+            batch_size = obs_img.size(0)
+            vision_features = torch.zeros(batch_size, self.encoding_size, device=obs_img.device)
         
+        if torch.isnan(vision_features).any():
+            print("WARNING: NaN in vision features, replacing with zeros")
+            vision_features = torch.nan_to_num(vision_features, nan=0.0)
+
+        # Normalize for anti explode
+        vision_features = vision_features / (vision_features.norm(dim=-1, keepdim=True) + 1e-8)
+
         batch_size = vision_features.size(0)
         vision_features = vision_features.unsqueeze(1)  # Add sequence dimension
         
         if hidden_state is None:
             hidden_state = self.init_hidden(batch_size, vision_features.device)
         
-        lstm_out, new_hidden_state = self.lstm(vision_features, hidden_state)
-        lstm_features = lstm_out.squeeze(1)  # Remove sequence dimension
+        # Clamp hid state to prevent explosion
+        h, c = hidden_state
+        h = torch.clamp(h, -10, 10)
+        c = torch.clamp(c, -10, 10)
+        hidden_state = (h, c)
+
+        try:
+            lstm_out, new_hidden_state = self.lstm(vision_features, hidden_state)
+            lstm_features = lstm_out.squeeze(1)
+        except Exception as e:
+            print(f"LSTM error: {e}")
+            lstm_features = vision_features.squeeze(1)
+            new_hidden_state = hidden_state
+        
+        # Normalize LSTM features
+        if torch.isnan(lstm_features).any():
+            print("WARNING: NaN in LSTM features")
+            lstm_features = torch.zeros_like(lstm_features)
+        
+        lstm_features = torch.clamp(lstm_features, -10, 10)
         
         self.hidden_state = new_hidden_state
         
         results = {'hidden_state': new_hidden_state}
         
         if mode == "policy" or mode == "all":
-            policy_logits = self.policy_net(lstm_features)
-            results['policy_logits'] = policy_logits
-            results['action_dist'] = Categorical(logits=policy_logits)
+            try:
+                policy_logits = self.policy_net(lstm_features)
+                # Prevent extreme values
+                policy_logits = torch.clamp(policy_logits, -10, 10)
+                
+                if torch.isnan(policy_logits).any():
+                    print("WARNING: NaN in policy logits, using uniform distribution")
+                    policy_logits = torch.zeros_like(policy_logits)
+                
+                results['policy_logits'] = policy_logits
+                results['action_dist'] = Categorical(logits=policy_logits)
+            except Exception as e:
+                print(f"Policy network error: {e}")
+                # Return uniform distribution
+                batch_size = lstm_features.size(0)
+                policy_logits = torch.zeros(batch_size, self.action_dim, device=lstm_features.device)
+                results['policy_logits'] = policy_logits
+                results['action_dist'] = Categorical(logits=policy_logits)
             
         if mode == "value" or mode == "all":
-            values = self.value_net(lstm_features)
-            results['values'] = values
+            try:
+                values = self.value_net(lstm_features)
+                values = torch.clamp(values, -100, 100)
+                results['values'] = values
+            except Exception as e:
+                print(f"Value network error: {e}")
+                results['values'] = torch.zeros(batch_size, device=lstm_features.device)
             
         if mode == "distance" or mode == "all":
-            distances = self.dist_pred_net(lstm_features)
-            results['distances'] = distances
+            try:
+                distances = self.dist_pred_net(lstm_features)
+                distances = torch.clamp(distances, 0, 100)
+                results['distances'] = distances
+            except Exception as e:
+                print(f"Distance network error: {e}")
+                results['distances'] = torch.zeros(batch_size, 1, device=lstm_features.device)
             
         if self.use_auxiliary_heads and (mode == "auxiliary" or mode == "all"):
-            collision_pred = self.collision_predictor(lstm_features)
-            exploration_pred = self.exploration_predictor(lstm_features)
-            results['collision_prediction'] = collision_pred
-            results['exploration_prediction'] = exploration_pred
-            
+            try:
+                collision_pred = self.collision_predictor(lstm_features)
+                exploration_pred = self.exploration_predictor(lstm_features)
+                results['collision_prediction'] = torch.clamp(collision_pred, 0, 1)
+                results['exploration_prediction'] = torch.clamp(exploration_pred, -10, 10)
+            except Exception as e:
+                print(f"Auxiliary heads error: {e}")
+                
         if mode == "features":
             results['features'] = lstm_features
             
@@ -140,7 +208,6 @@ class EnhancedNoMaDRL(nn.Module):
         return (h, c)
     
     def reset_hidden(self):
-        """Reset stored hidden state"""
         self.hidden_state = None
     
     def get_action(self, observations: Dict[str, torch.Tensor], deterministic: bool = False,
@@ -157,20 +224,46 @@ class EnhancedNoMaDRL(nn.Module):
             log_prob = action_dist.log_prob(action)
         return action, log_prob, outputs['hidden_state']
 
-
-class MultiComponentRewardCalculator:
-    """Multi-component reward system with configurable weights"""
-    def __init__(self, config: Dict):
-        self.config = config
-        self.success_reward = config.get('success_reward', 100.0)
-        self.distance_weight = config.get('distance_weight', 20.0)
-        self.step_penalty = config.get('step_penalty', 0.005)
-        self.collision_penalty = config.get('collision_penalty', 1.0)
-        self.exploration_bonus = config.get('exploration_bonus', 5.0)
-        self.curiosity_weight = config.get('curiosity_weight', 0.1)
-        
-        # Stage-specific weights
-        self.stage = config.get('training_stage', 1)
+    def evaluate_actions(self, observations: Dict[str, torch.Tensor], actions: torch.Tensor):
+        try:
+            outputs = self.forward(observations, mode="all")
+            
+            action_dist = outputs['action_dist']
+            log_probs = action_dist.log_prob(actions)
+            entropy = action_dist.entropy()
+            values = outputs['values']
+            
+            # Safety checks
+            log_probs = torch.clamp(log_probs, -20, 2)
+            entropy = torch.clamp(entropy, 0, 10)
+            values = torch.clamp(values, -100, 100)
+            
+            # Replace any remaining NaN
+            log_probs = torch.nan_to_num(log_probs, nan=-10.0)
+            entropy = torch.nan_to_num(entropy, nan=0.0)
+            values = torch.nan_to_num(values, nan=0.0)
+            
+            return log_probs, values, entropy
+            
+        except Exception as e:
+            print(f"Error in evaluate_actions: {e}")
+            batch_size = actions.size(0)
+            device = actions.device
+            return (
+                torch.zeros(batch_size, device=device),
+                torch.zeros(batch_size, device=device),
+                torch.ones(batch_size, device=device)
+            )
+    
+    def init_hidden(self, batch_size: int, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Initialize LSTM hidden state with small values"""
+        h = torch.zeros(self.lstm_num_layers, batch_size, self.lstm_hidden_size).to(device) * 0.01
+        c = torch.zeros(self.lstm_num_layers, batch_size, self.lstm_hidden_size).to(device) * 0.01
+        return (h, c)
+    
+    def reset_hidden(self):
+        """Reset stored hidden state"""
+        self.hidden_state = None
         
     def calculate_reward(self, event, obs, info: Dict, env) -> float:
         reward = 0.0
@@ -180,16 +273,23 @@ class MultiComponentRewardCalculator:
         
         if env.is_goal_conditioned:
             distance = env._distance_to_goal()
-            
-            if distance < env.success_distance:
-                reward += self.success_reward
-            
+
             if hasattr(env, '_prev_distance_to_goal'):
                 distance_improvement = env._prev_distance_to_goal - distance
                 reward += distance_improvement * self.distance_weight
             
             env._prev_distance_to_goal = distance
+
+            if distance < env.success_distance:
+                reward += self.success_reward
             
+            if distance < 5.0:
+                reward += 1.0
+            if distance < 3.0:
+                reward += 2.0
+            if distance < 2.0:
+                reward += 5.0
+
         else:
             # Exploration rewards
             current_pos = env._get_agent_position()
@@ -206,7 +306,7 @@ class MultiComponentRewardCalculator:
             
             # Movement reward
             if event.metadata['lastAction'] == 'MoveAhead' and event.metadata['lastActionSuccess']:
-                reward += 0.1
+                reward += 0.05
         
         # Stage-specific rewards
         if self.stage == 1:
@@ -329,15 +429,20 @@ class EvaluationMetrics:
 class PolicyNetwork(nn.Module):
     def __init__(self, input_dim: int, hidden_dim: int, action_dim: int = 4):
         super(PolicyNetwork, self).__init__()
+        self.action_dim = action_dim
         
+        # Add normalization layers
         self.network = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
             nn.ReLU(),
             nn.Dropout(0.1),
             nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
             nn.ReLU(),
             nn.Dropout(0.1),
             nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, action_dim)
         )
@@ -346,12 +451,16 @@ class PolicyNetwork(nn.Module):
     
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
-            nn.init.orthogonal_(module.weight, gain=0.01)
+            if module.out_features == self.action_dim:
+                # Very small initialization for output layer
+                nn.init.normal_(module.weight, mean=0.0, std=0.001)
+            else:
+                nn.init.xavier_normal_(module.weight, gain=0.5)
+            if module.bias is not None:
+                nn.init.constant_(module.bias, 0)
+        elif isinstance(module, nn.LayerNorm):
             nn.init.constant_(module.bias, 0)
-    
-    def forward(self, features: torch.Tensor) -> torch.Tensor:
-        return self.network(features)
-
+            nn.init.constant_(module.weight, 1)
 
 class ValueNetwork(nn.Module):
     def __init__(self, input_dim: int, hidden_dim: int):
@@ -397,3 +506,28 @@ class DenseNetwork(nn.Module):
         x = x.reshape((-1, self.embedding_dim))
         output = self.network(x)
         return output
+
+def prepare_observation(obs: Dict[str, np.ndarray], device: torch.device) -> Dict[str, torch.Tensor]:
+    torch_obs = {}
+    
+    required_keys = ['rgb', 'goal_rgb', 'context', 'goal_mask', 'goal_position']
+    for key in required_keys:
+        if key not in obs:
+            raise KeyError(f"Missing required observation key: {key}")
+    
+    for key, value in obs.items():
+        if isinstance(value, torch.Tensor):
+            tensor = value.float()
+        else:
+            tensor = torch.from_numpy(value).float()
+        
+        if key in ['rgb', 'goal_rgb', 'context']:
+            tensor = tensor / 255.0
+        torch_obs[key] = tensor.to(device)
+        
+        if torch_obs[key].dim() == 3:
+            torch_obs[key] = torch_obs[key].unsqueeze(0)
+        elif torch_obs[key].dim() == 1:
+            torch_obs[key] = torch_obs[key].unsqueeze(0)
+    
+    return torch_obs
