@@ -15,24 +15,22 @@ from datetime import datetime
 import sys
 sys.path.append(r'/home/tuandang/tuandang/quanganh/visualnav-transformer/train')
 
-from nomad_rl.environments.ai2thor_nomad_env import AI2ThorNoMaDEnv
-from nomad_rl.models.enhanced_nomad_rl_model import (
+from Unified.env import AI2ThorNoMaDEnv
+from TwoStage.nomad_model import (
     EnhancedNoMaDRL, MultiComponentRewardCalculator, 
     CurriculumManager, EvaluationMetrics, prepare_observation
 )
-from nomad_rl.training.two_stage_trainer import TwoStageTrainer
+from TwoStage.two_stage_train import TwoStageTrainer
 
 class UnifiedTrainer(TwoStageTrainer):    
     def __init__(self, config: Dict):
         self.dataset = config['dataset']  # 'ithor', 'robothor', or 'combined'
         self.splits = self._load_splits(config)
-        
         config['scene_names'] = self.splits['train']
         
         super().__init__(config)
         
         self.use_robothor = self._check_robothor_scenes(self.splits)
-        
         self.val_env = self._create_environment(
             self.splits['val'], 
             config, 
@@ -85,12 +83,12 @@ class UnifiedTrainer(TwoStageTrainer):
             print(f"Loaded splits from {splits_file}")
         else:
             if dataset == 'combined':
-                from combined_dataset_splits import CombinedAI2THORDatasetSplitter
+                from Unified.datasplit import CombinedAI2THORDatasetSplitter
                 splitter = CombinedAI2THORDatasetSplitter()
                 splits_dict = splitter.save_combined_splits()
                 splits = {k: v['combined'] for k, v in splits_dict.items()}
             else:
-                from dataset_splits import AI2THORDatasetSplitter
+                from TwoStage.datasplit import AI2THORDatasetSplitter
                 splitter = AI2THORDatasetSplitter()
                 splits = splitter.save_splits(dataset)
         
@@ -294,6 +292,7 @@ class UnifiedTrainer(TwoStageTrainer):
             print(f"{metric_name:<25} {train_val:>10.2f} {val_val:>10.2f} {test_val:>10.2f}")
         
         print("="*60)
+
 
 
 def main():

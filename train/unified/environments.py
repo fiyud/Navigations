@@ -17,7 +17,7 @@ class EnhancedAI2ThorEnv(gym.Env):
         image_size: Tuple[int, int] = (224, 224),
         max_episode_steps: int = 500,
         success_distance: float = 1.0,
-        rotation_step: int = 90,
+        rotation_step: int = 60,
         movement_step: float = 0.25,
         context_size: int = 5,
         goal_prob: float = 0.5,
@@ -72,7 +72,6 @@ class EnhancedAI2ThorEnv(gym.Env):
         self.position_visit_counts = {}
         
     def _is_robothor_scene(self, scene_name: str) -> bool:
-        """Check if a scene is from RoboTHOR"""
         return any(keyword in scene_name for keyword in ['Train', 'Val', 'Test'])
     
     def _initialize_controller(self, scene_name: Optional[str] = None):
@@ -100,8 +99,8 @@ class EnhancedAI2ThorEnv(gym.Env):
                 renderInstanceSegmentation=False,
                 width=self.image_size[0],
                 height=self.image_size[1],
-                fieldOfView=90,
-                commit_id="5e1af1e57b07a9b5e9fbb81a7e68e6375e3c3608"  # RoboTHOR compatible version
+                fieldOfView=60,
+               # commit_id="5e1af1e57b07a9b5e9fbb81a7e68e6375e3c3608"  # RoboTHOR compatible version
             )
         else:
             print(f"Initializing iTHOR controller for scene: {scene_name}")
@@ -115,7 +114,7 @@ class EnhancedAI2ThorEnv(gym.Env):
                 renderInstanceSegmentation=False,
                 width=self.image_size[0],
                 height=self.image_size[1],
-                fieldOfView=90,
+                fieldOfView=60,
                 visibilityDistance=1.5
             )
         
@@ -168,8 +167,6 @@ class EnhancedAI2ThorEnv(gym.Env):
         return self._format_observation(obs)
     
     def _get_robothor_reachable_positions(self):
-        """Get reachable positions for RoboTHOR scenes"""
-        # Generate a grid of positions to test
         positions = []
         bounds = self.controller.last_event.metadata.get('sceneBounds', {})
         
@@ -180,12 +177,10 @@ class EnhancedAI2ThorEnv(gym.Env):
             x_min, x_max = -5, 5
             z_min, z_max = -5, 5
         
-        # Generate grid positions
         for x in np.arange(x_min, x_max, 0.5):
             for z in np.arange(z_min, z_max, 0.5):
                 positions.append({'x': float(x), 'y': 0.0, 'z': float(z)})
         
-        # Filter reachable positions by trying to teleport
         reachable = []
         current_pos = self._get_agent_position()
         
@@ -232,7 +227,6 @@ class EnhancedAI2ThorEnv(gym.Env):
         return self._format_observation(obs), reward, done, info
     
     def _get_observation(self) -> Dict[str, np.ndarray]:
-        """Get current observation"""
         event = self.controller.last_event
         
         # Get RGB image
@@ -370,7 +364,6 @@ class EnhancedAI2ThorEnv(gym.Env):
             return len(self.visited_positions) > 10
     
     def _distance_to_goal(self) -> float:
-        """Calculate distance to goal"""
         if self.goal_position is None:
             return float('inf')
         
@@ -382,11 +375,9 @@ class EnhancedAI2ThorEnv(gym.Env):
         })
     
     def _get_agent_position(self) -> Dict[str, float]:
-        """Get agent current position"""
         return self.controller.last_event.metadata['agent']['position']
     
     def _calculate_distance(self, pos1, pos2) -> float:
-        """Calculate Euclidean distance between two positions"""
         return np.sqrt(
             (pos1['x'] - pos2['x'])**2 +
             (pos1['z'] - pos2['z'])**2
@@ -401,3 +392,4 @@ class EnhancedAI2ThorEnv(gym.Env):
             event = self.controller.last_event
             return np.array(event.frame)
         return None
+    

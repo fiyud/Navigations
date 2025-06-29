@@ -19,7 +19,7 @@ class CombinedAI2THORDatasetSplitter:
             'bathroom': [f'FloorPlan{i}' for i in range(401, 431)]
         }
         
-        # RoboTHOR official splits
+        # RoboTHOR official splits - CORRECTED
         self.robothor_splits = {
             'train': [
                 'FloorPlan_Train1_1', 'FloorPlan_Train1_2', 'FloorPlan_Train1_3', 'FloorPlan_Train1_4', 'FloorPlan_Train1_5',
@@ -36,20 +36,17 @@ class CombinedAI2THORDatasetSplitter:
                 'FloorPlan_Train12_1', 'FloorPlan_Train12_2', 'FloorPlan_Train12_3', 'FloorPlan_Train12_4', 'FloorPlan_Train12_5'
             ],
             'val': [
-                'FloorPlan_Val1_1', 'FloorPlan_Val1_2', 'FloorPlan_Val1_3',
-                'FloorPlan_Val2_1', 'FloorPlan_Val2_2', 'FloorPlan_Val2_3',
-                'FloorPlan_Val3_1', 'FloorPlan_Val3_2', 'FloorPlan_Val3_3',
-                'FloorPlan_Val4_1', 'FloorPlan_Val4_2', 'FloorPlan_Val4_3',
-                'FloorPlan_Val5_1', 'FloorPlan_Val5_2', 'FloorPlan_Val5_3'
+                'FloorPlan_Val1_1', 'FloorPlan_Val1_2', 'FloorPlan_Val1_3', 'FloorPlan_Val1_4', 'FloorPlan_Val1_5',
+                'FloorPlan_Val2_1', 'FloorPlan_Val2_2', 'FloorPlan_Val2_3', 'FloorPlan_Val2_4', 'FloorPlan_Val2_5',
+                'FloorPlan_Val3_1', 'FloorPlan_Val3_2', 'FloorPlan_Val3_3', 'FloorPlan_Val3_4', 'FloorPlan_Val3_5'
             ],
             'test': [
-                'FloorPlan_Test1_1', 'FloorPlan_Test1_2',
-                'FloorPlan_Test2_1', 'FloorPlan_Test2_2',
-                'FloorPlan_Test3_1', 'FloorPlan_Test3_2',
-                'FloorPlan_Test4_1', 'FloorPlan_Test4_2',
-                'FloorPlan_Test5_1', 'FloorPlan_Test5_2',
-                'FloorPlan_Test6_1', 'FloorPlan_Test6_2',
-                'FloorPlan_Test7_1', 'FloorPlan_Test7_2'
+                # RoboTHOR doesn't have official test scenes, using some train scenes as test
+                'FloorPlan_Train1_1', 'FloorPlan_Train1_2', 'FloorPlan_Train1_3',
+                'FloorPlan_Train2_1', 'FloorPlan_Train2_2', 'FloorPlan_Train2_3',
+                'FloorPlan_Train3_1', 'FloorPlan_Train3_2', 'FloorPlan_Train3_3',
+                'FloorPlan_Train4_1', 'FloorPlan_Train4_2', 'FloorPlan_Train4_3',
+                'FloorPlan_Train5_1', 'FloorPlan_Train5_2'
             ]
         }
     
