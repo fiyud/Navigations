@@ -392,4 +392,14 @@ class EnhancedAI2ThorEnv(gym.Env):
             event = self.controller.last_event
             return np.array(event.frame)
         return None
-    
+
+    def seed(self, seed: Optional[int] = None):
+        if seed is not None:
+            random.seed(seed)
+            np.random.seed(seed)
+            if self.controller:
+                self.controller.seed(seed)
+        else:
+            seed = random.randint(0, 2**32 - 1)
+            self.seed(seed)
+        return [seed]
