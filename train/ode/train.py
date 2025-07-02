@@ -23,7 +23,7 @@ from model import (
     visualize_spatial_memory_graph
 )
 
-from ode.grid.grid_mana import GridBasedCurriculumManager
+from ode.preprocess.grid_mana import GridBasedCurriculumManager
 from unified.environments import EnhancedAI2ThorEnv
 from arch.nomad_rl import prepare_observation, PPOBuffer
 # from vint_train.models.nomad.nomad_vint import NoMaD_ViNT, replace_bn_with_gn
