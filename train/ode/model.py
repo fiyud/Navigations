@@ -7,7 +7,7 @@ from torch.distributions import Categorical
 
 import sys
 sys.path.append(r'D:\NCKH.2025-2026\Navigations\train')
-from vint_train.models.nomad.nomad_vint import NoMaD_ViNT, replace_bn_with_gn
+from arch.nomad import NoMaD_ViNT, replace_bn_with_gn
 
 from memory_state import UnifiedSpatialMemoryGraphODE
 from worldModel import CounterfactualWorldModel
@@ -17,7 +17,6 @@ class UnifiedAdvancedNoMaDRL(nn.Module):
     Advanced NoMaD-RL with Unified Spatial Memory Graph (Neural ODE/PDE)
     and Counterfactual World Model
     """
-    
     def __init__(
         self,
         action_dim: int = 4,

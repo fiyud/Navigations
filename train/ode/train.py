@@ -25,8 +25,8 @@ from model import (
 
 from ode.grid.grid_mana import GridBasedCurriculumManager
 from unified.environments import EnhancedAI2ThorEnv
-from nomad_rl.models.nomad_rl_model import prepare_observation, PPOBuffer
-
+from arch.nomad_rl import prepare_observation, PPOBuffer
+# from vint_train.models.nomad.nomad_vint import NoMaD_ViNT, replace_bn_with_gn
 
 class UnifiedAdvancedNoMaDTrainer:
     def __init__(self, config: Dict):
@@ -386,7 +386,6 @@ class UnifiedAdvancedNoMaDTrainer:
             print(f"Failed to visualize graph: {e}")
     
     def _log_training_stats(self, timesteps: int, rollout_stats: Dict, update_stats: Dict):
-        """Log training statistics"""
         curriculum_stats = self.curriculum_manager.get_progress_stats()
         
         print(f"\n--- Update {timesteps // self.config['rollout_steps']} (Timesteps: {timesteps}) ---")
@@ -405,7 +404,6 @@ class UnifiedAdvancedNoMaDTrainer:
         if 'spatial_smoothness_loss' in update_stats:
             print(f"Spatial Smoothness Loss: {update_stats['spatial_smoothness_loss']:.4f}")
         
-        # Wandb logging
         if self.config.get('use_wandb', False):
             wandb.log({
                 'timesteps': timesteps,
@@ -570,7 +568,6 @@ class UnifiedAdvancedNoMaDTrainer:
         return save_path
     
     def _run_final_evaluation(self) -> Dict:
-        """Run final evaluation on all splits"""
         final_results = {}
         
         # Load best model if available
