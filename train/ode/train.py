@@ -12,9 +12,10 @@ from typing import Dict, List, Tuple, Optional
 import time
 from datetime import datetime
 from torch.cuda.amp import autocast, GradScaler
+from tqdm import tqdm
 
 import sys
-sys.path.append(r'D:\NCKH.2025-2026\Navigations\train')
+sys.path.append(r'/home/tuandang/tuandang/quanganh/visualnav-transformer/train/ode')
 
 from model import (
     UnifiedAdvancedNoMaDRL, 
@@ -23,10 +24,13 @@ from model import (
     visualize_spatial_memory_graph
 )
 
-from ode.preprocess.grid_mana import GridBasedCurriculumManager
-from unified.environments import EnhancedAI2ThorEnv
-from arch.nomad_rl import prepare_observation, PPOBuffer
-# from vint_train.models.nomad.nomad_vint import NoMaD_ViNT, replace_bn_with_gn
+from preprocess.grid_manager import GridBasedCurriculumManager
+from environments import EnhancedAI2ThorEnv
+from nomad_rl.models.nomad_rl_model import prepare_observation, PPOBuffer
+
+torch.autograd.set_detect_anomaly(True)
+import torch.fx.traceback as fx_traceback
+fx_traceback.has_preserved_node_meta = lambda: False
 
 class UnifiedAdvancedNoMaDTrainer:
     def __init__(self, config: Dict):
@@ -36,12 +40,17 @@ class UnifiedAdvancedNoMaDTrainer:
         self.dataset = config['dataset']
         self.splits = self._load_splits(config)
         
+        # Initialize curriculum manager
         self.curriculum_manager = GridBasedCurriculumManager(config, self.dataset)
         curriculum_settings = self.curriculum_manager.get_current_settings()
         
+        self.reset_graph_every_n_episodes = config.get('reset_graph_every_n_episodes', 50)
+        self.episodes_since_graph_reset = 0
+
+        # Get initial training scenes
         self.all_train_scenes = self.splits['train']
         current_scenes = self.curriculum_manager.get_current_scenes(self.all_train_scenes)
-        
+
         self.env = self._create_environment(
             current_scenes,
             config,
@@ -55,7 +64,12 @@ class UnifiedAdvancedNoMaDTrainer:
         # Optimizer with different learning rates for different components
         self.optimizer = self._create_optimizer()
         
-        # Mixed precision training
+        self.scheduler = optim.lr_scheduler.StepLR(
+            self.optimizer, 
+            step_size=100,
+            gamma=0.9
+        )
+        
         self.use_amp = config.get('use_amp', True)
         self.scaler = GradScaler() if self.use_amp else None
         
@@ -84,19 +98,23 @@ class UnifiedAdvancedNoMaDTrainer:
         self.counterfactual_accuracy = deque(maxlen=100)
         
         # Validation and test environments
-        self.val_env = self._create_environment(
-            self.splits['val'],
-            config,
-            goal_prob=config.get('eval_goal_prob', 1.0)
-        )
+        # self.val_env = self._create_environment(
+        #     self.splits['val'],
+        #     config,
+        #     goal_prob=config.get('eval_goal_prob', 1.0)
+        # )
         
-        self.test_env = self._create_environment(
-            self.splits['test'],
-            config,
-            goal_prob=config.get('eval_goal_prob', 1.0)
-        )
+        # self.test_env = self._create_environment(
+        #     self.splits['test'],
+        #     config,
+        #     goal_prob=config.get('eval_goal_prob', 1.0)
+        # )
         
-        # Results tracking
+        self.val_env = None
+        self.test_env = None
+        self.val_scenes = self.splits['val']
+        self.test_scenes = self.splits['test']
+
         self.results = {
             'train': defaultdict(list),
             'val': defaultdict(list),
@@ -145,22 +163,31 @@ class UnifiedAdvancedNoMaDTrainer:
         # Different learning rates for different components
         base_lr = self.config['learning_rate']
         param_groups = [
-            {'params': vision_params, 'lr': base_lr * 0.1},  # Lower LR for vision
-            {'params': spatial_graph_params, 'lr': base_lr * 2},  # Higher LR for new ODE component
+            {'params': vision_params, 'lr': base_lr * 0.1},
+            {'params': spatial_graph_params, 'lr': base_lr * 2},
             {'params': counterfactual_params, 'lr': base_lr},
+            # {'params': value_params, 'lr': base_lr * 0.1},  # Lower LR for value network
             {'params': other_params, 'lr': base_lr}
         ]
-        
+                
         return optim.Adam(param_groups)
     
     def collect_rollouts(self, num_steps: int) -> Dict[str, float]:
         """Collect rollouts with unified model"""
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
         obs = self.env.reset()
         torch_obs = prepare_observation(obs, self.device)
         
-        # Reset episode
+        if hasattr(self.model.spatial_memory_graph, 'graph_state') and self.model.spatial_memory_graph.graph_state:
+            print(f"Graph nodes before reset: {self.model.spatial_memory_graph.graph_state.num_nodes}")
+
         self.training_wrapper.reset_episode()
         
+        if hasattr(self.model.spatial_memory_graph, 'graph_state') and self.model.spatial_memory_graph.graph_state:
+            print(f"Graph nodes after reset: {self.model.spatial_memory_graph.graph_state.num_nodes}")
+
         episode_reward = 0
         episode_length = 0
         episode_success = False
@@ -168,21 +195,50 @@ class UnifiedAdvancedNoMaDTrainer:
         episode_graph_sizes = []
         episode_path_confs = []
         
+        episode_penalties = 0
+        episode_exploration_rewards = 0
+        episode_goal_rewards = 0
+        action_counts = defaultdict(int)
+
+        if not hasattr(self, 'goal_conditioned_episodes'):
+            self.goal_conditioned_episodes = 0
+            self.exploration_episodes = 0
+
         rollout_stats = defaultdict(float)
         rollout_stats['episodes'] = 0
         
         for step in range(num_steps):
+            # with torch.no_grad():
+            #     if self.use_amp:
+            #         with autocast():
+            #             action, log_prob, extra_info = self.training_wrapper.step(torch_obs)
+            #             outputs = self.model.forward(torch_obs, mode="all", 
+            #                                     time_delta=self.training_wrapper.get_time_delta())
+            #     else:
+            #         action, log_prob, extra_info = self.training_wrapper.step(torch_obs)
+            #         outputs = self.model.forward(torch_obs, mode="all", 
+            #                                 time_delta=self.training_wrapper.get_time_delta())
+            #     value = outputs['values']
+            
             with torch.no_grad():
-                # Get action using training wrapper (handles time)
                 action, log_prob, extra_info = self.training_wrapper.step(torch_obs)
-                
                 outputs = self.model.forward(torch_obs, mode="all", 
-                                           time_delta=self.training_wrapper.get_time_delta())
+                                        time_delta=self.training_wrapper.get_time_delta())
                 value = outputs['values']
-            
-            next_obs, reward, done, info = self.env.step(action.cpu().item())
+
+            action_item = action.cpu().item()
+            action_counts[action_item] += 1
+
+            next_obs, reward, done, info = self.env.step(action_item)
             next_torch_obs = prepare_observation(next_obs, self.device)
-            
+
+            if reward < 0:
+                episode_penalties += reward
+            if info.get('exploration_reward', 0) > 0:
+                episode_exploration_rewards += info.get('exploration_reward', 0)
+            if info.get('goal_reward', 0) > 0:
+                episode_goal_rewards += info.get('goal_reward', 0)
+
             self.buffer.store(
                 obs=torch_obs,
                 action=action,
@@ -205,6 +261,37 @@ class UnifiedAdvancedNoMaDTrainer:
             rollout_stats['total_reward'] += reward
             
             if done:
+                if self.env.is_goal_conditioned:
+                    self.goal_conditioned_episodes += 1
+                else:
+                    self.exploration_episodes += 1
+
+                total_episodes = self.goal_conditioned_episodes + self.exploration_episodes
+                if total_episodes % 10 == 0:
+                    print(f"\nEpisode Summary - Total: {total_episodes}, "
+                        f"Goal: {self.goal_conditioned_episodes} ({self.goal_conditioned_episodes/total_episodes*100:.1f}%), "
+                        f"Exploration: {self.exploration_episodes} ({self.exploration_episodes/total_episodes*100:.1f}%)")
+
+                if self.config.get('use_wandb', False):
+                    episode_metrics = {
+                        'episode/reward': episode_reward,
+                        'episode/length': episode_length,
+                        'episode/success': float(episode_success),
+                        'episode/collisions': episode_collisions,
+                        'episode/penalties': episode_penalties,
+                        'episode/exploration_rewards': episode_exploration_rewards,
+                        'episode/goal_rewards': episode_goal_rewards,
+                        'episode/avg_graph_size': np.mean(episode_graph_sizes),
+                        'episode/avg_path_confidence': np.mean(episode_path_confs),
+                        'episode/collision_rate': episode_collisions / max(1, episode_length),
+                    }
+                    
+                    # Action distribution
+                    for action_idx in range(self.env.action_space.n):
+                        episode_metrics[f'episode/action_{action_idx}_freq'] = action_counts[action_idx] / episode_length
+                
+                    wandb.log(episode_metrics)
+
                 self.episode_rewards.append(episode_reward)
                 self.episode_lengths.append(episode_length)
                 self.success_rates.append(1.0 if episode_success else 0.0)
@@ -212,6 +299,10 @@ class UnifiedAdvancedNoMaDTrainer:
                 self.path_confidences.append(np.mean(episode_path_confs))
                 
                 # Update curriculum
+                print(f"Episode finished - Reward: {episode_reward:.2f}, "
+                f"Success: {episode_success}, Length: {episode_length}, "
+                f"Type: {'GOAL' if self.env.is_goal_conditioned else 'EXPLORE'}")
+                
                 self.curriculum_manager.update(
                     episode_success=episode_success,
                     episode_length=episode_length,
@@ -223,10 +314,21 @@ class UnifiedAdvancedNoMaDTrainer:
                 rollout_stats['collisions'] += episode_collisions
                 rollout_stats['avg_graph_size'] += np.mean(episode_graph_sizes)
                 rollout_stats['avg_path_conf'] += np.mean(episode_path_confs)
+                rollout_stats['total_penalties'] += episode_penalties
+                rollout_stats['total_exploration_rewards'] += episode_exploration_rewards
+                rollout_stats['total_goal_rewards'] += episode_goal_rewards
                 
                 obs = self.env.reset()
                 torch_obs = prepare_observation(obs, self.device)
-                self.training_wrapper.reset_episode()
+
+                self.episodes_since_graph_reset += 1
+    
+                # Only reset graph periodically
+                if self.episodes_since_graph_reset >= self.reset_graph_every_n_episodes:
+                    print(f"Resetting spatial memory graph after {self.episodes_since_graph_reset} episodes")
+                    self.model.reset_memory()
+                    self.episodes_since_graph_reset = 0
+                # self.training_wrapper.reset_episode()
                 
                 episode_reward = 0
                 episode_length = 0
@@ -234,10 +336,17 @@ class UnifiedAdvancedNoMaDTrainer:
                 episode_collisions = 0
                 episode_graph_sizes = []
                 episode_path_confs = []
+                episode_penalties = 0
+                episode_exploration_rewards = 0
+                episode_goal_rewards = 0
+                action_counts = defaultdict(int)
             else:
                 obs = next_obs
                 torch_obs = next_torch_obs
-        
+            
+            if step % 30 == 0:
+                torch.cuda.empty_cache()
+
         with torch.no_grad():
             final_value = self.model.forward(
                 torch_obs, 
@@ -252,11 +361,18 @@ class UnifiedAdvancedNoMaDTrainer:
             rollout_stats['avg_graph_size'] /= rollout_stats['episodes']
             rollout_stats['avg_path_conf'] /= rollout_stats['episodes']
         
+        current_pos = self.env._get_agent_position()
+        print(f"Step {step}: Position ({current_pos['x']:.2f}, {current_pos['z']:.2f})")
+
         return rollout_stats
     
     def update_policy(self) -> Dict[str, float]:
         batch = self.buffer.get()
         update_stats = defaultdict(float)
+        
+        returns = batch['returns']
+        returns = (returns - returns.mean()) / (returns.std() + 1e-8)
+        batch['returns'] = returns
         
         advantages = batch['advantages']
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
@@ -270,7 +386,12 @@ class UnifiedAdvancedNoMaDTrainer:
             'returns': batch['returns']
         }
         
-        for epoch in range(self.ppo_epochs):
+        print(f"  Running {self.ppo_epochs} PPO epochs with batch size {self.batch_size}")
+        
+        # Progress bar for PPO epochs
+        epoch_pbar = tqdm(range(self.ppo_epochs), desc="  PPO Epochs", leave=False)
+        
+        for epoch in epoch_pbar:
             indices = torch.randperm(len(advantages))
             
             for start in range(0, len(advantages), self.batch_size):
@@ -300,38 +421,71 @@ class UnifiedAdvancedNoMaDTrainer:
                     losses['total_loss'].backward()
                     nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
                     self.optimizer.step()
-                
+                    self.scheduler.step()
                 # Track statistics
                 for key, value in losses.items():
                     update_stats[key] += value.item()
+            
+            # Update epoch progress bar
+            epoch_pbar.set_postfix({
+                'policy_loss': f"{update_stats['policy_loss']/(epoch+1):.4f}",
+                'value_loss': f"{update_stats['value_loss']/(epoch+1):.4f}"
+            })
         
         # Average statistics
         num_updates = self.ppo_epochs * (len(advantages) // self.batch_size)
         for key in update_stats:
             update_stats[key] /= max(1, num_updates)
         
+        print(f"  Update complete - Policy loss: {update_stats['policy_loss']:.4f}, Value loss: {update_stats['value_loss']:.4f}")
+        
         return dict(update_stats)
     
     def train(self, total_timesteps: int):
-        """Main training loop"""
+        print("="*80)
         print(f"Starting unified training for {total_timesteps} timesteps...")
+        print(f"Dataset: {self.dataset}")
+        print(f"Device: {self.device}")
+        print(f"Model parameters: {sum(p.numel() for p in self.model.parameters()):,}")
+        print("="*80)
         
         timesteps_collected = 0
         update_count = 0
         
+        # Create progress bar for total timesteps
+        pbar = tqdm(total=total_timesteps, desc="Training Progress", unit="timesteps")
+        
         while timesteps_collected < total_timesteps:
             # Check for curriculum update
             if update_count > 0 and update_count % self.config.get('curriculum_update_freq', 10) == 0:
+                print(f"\n[Update {update_count}] Checking curriculum progression...")
                 old_level = self.curriculum_manager.current_level
                 if self.curriculum_manager.current_level != old_level:
                     self._update_environment_curriculum()
             
             # Collect rollouts
+            print(f"\n[Update {update_count}] Collecting rollouts...")
+            rollout_start_time = time.time()
             rollout_stats = self.collect_rollouts(self.config['rollout_steps'])
+            rollout_time = time.time() - rollout_start_time
             timesteps_collected += self.config['rollout_steps']
             
+            # Update policy
+            print(f"[Update {update_count}] Updating policy...")
+            update_start_time = time.time()
             update_stats = self.update_policy()
+            update_time = time.time() - update_start_time
             update_count += 1
+            
+            # Update progress bar
+            pbar.update(self.config['rollout_steps'])
+            pbar.set_postfix({
+                'reward': f"{np.mean(self.episode_rewards) if self.episode_rewards else 0:.2f}",
+                'success': f"{np.mean(self.success_rates) if self.success_rates else 0:.2%}",
+                'update': update_count
+            })
+            
+            print(f"[Update {update_count}] Rollout time: {rollout_time:.2f}s, Update time: {update_time:.2f}s")
             
             if update_count % 10 == 0:
                 torch.cuda.empty_cache()
@@ -341,33 +495,59 @@ class UnifiedAdvancedNoMaDTrainer:
                 
                 # Visualize graph periodically
                 if update_count % (self.config['log_freq'] * 10) == 0:
+                    print(f"\n[Update {update_count}] Visualizing spatial memory graph...")
                     self._visualize_graph(update_count)
             
             if update_count % self.config.get('val_freq', 100) == 0:
+                print(f"\n[Update {update_count}] Running validation...")
                 val_metrics = self._evaluate_on_split('val', self.val_env)
                 self.results['val']['timesteps'].append(timesteps_collected)
+                
+                # Log validation metrics to WandB
+                if self.config.get('use_wandb', False):
+                    val_wandb_metrics = {
+                        f'val/{key}': value for key, value in val_metrics.items()
+                    }
+                    wandb.log(val_wandb_metrics, step=timesteps_collected)
+                
                 for key, value in val_metrics.items():
                     self.results['val'][key].append(value)
                 
                 if val_metrics['success_rate'] > self.best_val_success_rate:
+                    print(f"New best validation success rate: {val_metrics['success_rate']:.2%}")
                     self.best_val_success_rate = val_metrics['success_rate']
+                    
+                    # Log best metrics
+                    if self.config.get('use_wandb', False):
+                        wandb.log({
+                            'val/best_success_rate': self.best_val_success_rate,
+                            'val/best_at_timestep': timesteps_collected
+                        }, step=timesteps_collected)
+                    
                     self.best_val_checkpoint = self._save_model(
                         update_count, timesteps_collected, is_best=True
                     )
             
             # Regular checkpoint
             if update_count % self.config['save_freq'] == 0:
+                print(f"\n[Update {update_count}] Saving checkpoint...")
                 self._save_model(update_count, timesteps_collected)
         
+        pbar.close()
+        
         # Final evaluation
-        print("\nTraining completed! Running final evaluation...")
+        print("\n" + "="*80)
+        print("Training completed! Running final evaluation...")
+        print("="*80)
         final_results = self._run_final_evaluation()
         self._save_final_results(final_results)
         
         # Cleanup
         self.env.close()
-        self.val_env.close()
-        self.test_env.close()
+        if self.val_env is not None:
+            self.val_env.close()
+        if self.test_env is not None:
+            self.test_env.close()
         
         return final_results
     
@@ -391,34 +571,110 @@ class UnifiedAdvancedNoMaDTrainer:
         print(f"\n--- Update {timesteps // self.config['rollout_steps']} (Timesteps: {timesteps}) ---")
         print(f"Curriculum Level: {curriculum_stats['current_level']} ({curriculum_stats['level_name']})")
         
-        if len(self.episode_rewards) > 0:
-            print(f"Episode Reward: {np.mean(self.episode_rewards):.2f} ± {np.std(self.episode_rewards):.2f}")
-            print(f"Success Rate: {np.mean(self.success_rates):.2%}")
-            print(f"Avg Graph Size: {np.mean(self.graph_sizes):.1f} nodes")
-            print(f"Path Confidence: {np.mean(self.path_confidences):.3f}")
+        # Calculate detailed metrics
+        metrics = {}
         
-        print(f"Policy Loss: {update_stats['policy_loss']:.4f}")
-        print(f"Value Loss: {update_stats['value_loss']:.4f}")
+        if len(self.episode_rewards) > 0:
+            # Basic metrics
+            metrics['episode_reward_mean'] = np.mean(self.episode_rewards)
+            metrics['episode_reward_std'] = np.std(self.episode_rewards)
+            metrics['episode_reward_min'] = np.min(self.episode_rewards)
+            metrics['episode_reward_max'] = np.max(self.episode_rewards)
+            
+            metrics['success_rate'] = np.mean(self.success_rates)
+            metrics['episode_length_mean'] = np.mean(self.episode_lengths)
+            metrics['episode_length_std'] = np.std(self.episode_lengths)
+            
+            # Graph metrics
+            metrics['graph_size_mean'] = np.mean(self.graph_sizes)
+            metrics['graph_size_max'] = np.max(self.graph_sizes) if self.graph_sizes else 0
+            metrics['path_confidence_mean'] = np.mean(self.path_confidences)
+            
+            print(f"Episode Reward: {metrics['episode_reward_mean']:.2f} ± {metrics['episode_reward_std']:.2f}")
+            print(f"Success Rate: {metrics['success_rate']:.2%}")
+            print(f"Avg Graph Size: {metrics['graph_size_mean']:.1f} nodes")
+            print(f"Path Confidence: {metrics['path_confidence_mean']:.3f}")
+        
+        # Loss metrics
+        metrics['losses/policy_loss'] = update_stats['policy_loss']
+        metrics['losses/value_loss'] = update_stats['value_loss']
+        metrics['losses/entropy_loss'] = update_stats.get('entropy_loss', 0)
+        metrics['losses/total_loss'] = update_stats['total_loss']
+        
+        # Auxiliary losses
         if 'counterfactual_loss' in update_stats:
-            print(f"Counterfactual Loss: {update_stats['counterfactual_loss']:.4f}")
+            metrics['losses/counterfactual_loss'] = update_stats['counterfactual_loss']
         if 'spatial_smoothness_loss' in update_stats:
-            print(f"Spatial Smoothness Loss: {update_stats['spatial_smoothness_loss']:.4f}")
+            metrics['losses/spatial_smoothness_loss'] = update_stats['spatial_smoothness_loss']
+        
+        print(f"Policy Loss: {metrics['losses/policy_loss']:.4f}")
+        print(f"Value Loss: {metrics['losses/value_loss']:.4f}")
+        
+        # Curriculum metrics
+        metrics['curriculum/level'] = curriculum_stats['current_level']
+        metrics['curriculum/level_name'] = curriculum_stats['level_name']
+        metrics['curriculum/episodes_at_level'] = curriculum_stats['episodes_at_level']
+        metrics['curriculum/current_success_rate'] = curriculum_stats['current_success_rate']
+        metrics['curriculum/grid_range_min'] = curriculum_stats['grid_range'][0]
+        metrics['curriculum/grid_range_max'] = curriculum_stats['grid_range'][1]
+        
+        # Rollout statistics
+        if rollout_stats:
+            metrics['rollout/episodes'] = rollout_stats.get('episodes', 0)
+            metrics['rollout/successes'] = rollout_stats.get('successes', 0)
+            metrics['rollout/collisions'] = rollout_stats.get('collisions', 0)
+            metrics['rollout/avg_graph_size'] = rollout_stats.get('avg_graph_size', 0)
+            metrics['rollout/avg_path_conf'] = rollout_stats.get('avg_path_conf', 0)
+            
+            # Calculate rates
+            if rollout_stats.get('episodes', 0) > 0:
+                metrics['rollout/collision_rate'] = rollout_stats['collisions'] / rollout_stats['episodes']
+                metrics['rollout/success_rate_batch'] = rollout_stats['successes'] / rollout_stats['episodes']
+        
+        # Training progress
+        metrics['training/timesteps'] = timesteps
+        metrics['training/episodes_total'] = len(self.episode_rewards)
+        metrics['training/updates'] = timesteps // self.config['rollout_steps']
+        
+        # Learning rate (if using scheduler)
+        metrics['training/learning_rate'] = self.optimizer.param_groups[0]['lr']
+        
+        # Memory usage
+        if torch.cuda.is_available():
+            metrics['system/gpu_memory_allocated'] = torch.cuda.memory_allocated() / 1e9  # GB
+            metrics['system/gpu_memory_reserved'] = torch.cuda.memory_reserved() / 1e9  # GB
         
         if self.config.get('use_wandb', False):
-            wandb.log({
-                'timesteps': timesteps,
-                'curriculum/level': curriculum_stats['current_level'],
-                'episode_reward_mean': np.mean(self.episode_rewards) if self.episode_rewards else 0,
-                'success_rate': np.mean(self.success_rates) if self.success_rates else 0,
-                'graph_size': np.mean(self.graph_sizes) if self.graph_sizes else 0,
-                'path_confidence': np.mean(self.path_confidences) if self.path_confidences else 0,
-                **update_stats})
+            wandb.log(metrics, step=timesteps)
     
     def _evaluate_on_split(self, split_name: str, env: EnhancedAI2ThorEnv, 
-                          num_episodes: Optional[int] = None) -> Dict[str, float]:
+                      num_episodes: Optional[int] = None) -> Dict[str, float]:
         """Evaluate on a specific split"""
         if num_episodes is None:
             num_episodes = self.config.get('eval_episodes', 20)
+
+        created_env = False
+        if env is None:
+            if split_name == 'val':
+                if self.val_env is None:
+                    print(f"Creating validation environment...")
+                    self.val_env = self._create_environment(
+                        self.val_scenes,
+                        self.config,
+                        goal_prob=self.config.get('eval_goal_prob', 1.0)
+                    )
+                    created_env = True
+                env = self.val_env
+            elif split_name == 'test':
+                if self.test_env is None:
+                    print(f"Creating test environment...")
+                    self.test_env = self._create_environment(
+                        self.test_scenes,
+                        self.config,
+                        goal_prob=self.config.get('eval_goal_prob', 1.0)
+                    )
+                    created_env = True
+                env = self.test_env
         
         print(f"\nEvaluating on {split_name} split ({num_episodes} episodes)...")
         self.model.eval()
@@ -429,7 +685,10 @@ class UnifiedAdvancedNoMaDTrainer:
         episode_graph_sizes = []
         episode_path_confs = []
         
-        for episode_idx in range(num_episodes):
+        # Progress bar for evaluation episodes
+        eval_pbar = tqdm(range(num_episodes), desc=f"Evaluating {split_name}", leave=False)
+        
+        for episode_idx in eval_pbar:
             obs = env.reset()
             torch_obs = prepare_observation(obs, self.device)
             
@@ -465,9 +724,12 @@ class UnifiedAdvancedNoMaDTrainer:
             episode_graph_sizes.append(np.mean(graph_sizes))
             episode_path_confs.append(np.mean(path_confs))
             
-            if (episode_idx + 1) % 10 == 0:
-                current_sr = sum(episode_successes) / len(episode_successes)
-                print(f"  Completed {episode_idx + 1}/{num_episodes} episodes (SR: {current_sr:.2%})")
+            # Update progress bar
+            current_sr = sum(episode_successes) / len(episode_successes)
+            eval_pbar.set_postfix({
+                'success_rate': f"{current_sr:.2%}",
+                'avg_reward': f"{np.mean(episode_rewards):.2f}"
+            })
         
         self.model.train()
         
@@ -487,7 +749,11 @@ class UnifiedAdvancedNoMaDTrainer:
         print(f"  Avg Reward: {metrics['avg_reward']:.2f} ± {metrics['std_reward']:.2f}")
         print(f"  Avg Graph Size: {metrics['avg_graph_size']:.1f} nodes")
         print(f"  Path Confidence: {metrics['avg_path_confidence']:.3f}")
-        
+
+        if created_env and split_name == 'test':
+            env.close()
+            if split_name == 'test':
+                self.test_env = None
         return metrics
     
     def _update_environment_curriculum(self):
@@ -523,9 +789,9 @@ class UnifiedAdvancedNoMaDTrainer:
         dataset = config['dataset']
         
         if dataset == 'combined':
-            splits_file = config.get('splits_file', './config/splits/combined_splits.yaml')
+            splits_file = config.get('splits_file', '/home/tuandang/tuandang/quanganh/visualnav-transformer/train/ode/grid/config/splits/combined_splits.yaml')
         else:
-            splits_file = config.get('splits_file', f'./config/splits/{dataset}_splits.yaml')
+            splits_file = config.get('splits_file', f'/home/tuandang/tuandang/quanganh/visualnav-transformer/train/ode/grid/config/splits/{dataset}_splits.yaml')
         
         if os.path.exists(splits_file):
             with open(splits_file, 'r') as f:
@@ -568,6 +834,7 @@ class UnifiedAdvancedNoMaDTrainer:
         return save_path
     
     def _run_final_evaluation(self) -> Dict:
+        """Run final evaluation on all splits"""
         final_results = {}
         
         # Load best model if available
@@ -675,6 +942,7 @@ def main():
                        help='Resume from checkpoint')
     parser.add_argument('--mode', type=str, choices=['train', 'eval', 'test'],
                        default='train', help='Mode to run')
+
     args = parser.parse_args()
     
     # Load config
@@ -682,18 +950,38 @@ def main():
         config = yaml.safe_load(f)
     
     config['dataset'] = args.dataset
-    
+
+    trainer = UnifiedAdvancedNoMaDTrainer(config)
+
     # Initialize wandb if enabled
     if config.get('use_wandb', False) and args.mode == 'train':
         wandb.init(
             project=config.get('wandb_project', 'nomad-rl-unified-advanced'),
             name=f"{args.dataset}_unified_advanced_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
-            config=config
+            config={
+                **config,
+                'dataset': args.dataset,
+                'model_params': sum(p.numel() for p in trainer.model.parameters()),
+                'device': str(trainer.device),
+                'curriculum_levels': len(trainer.curriculum_manager.levels) if hasattr(trainer, 'curriculum_manager') else 0
+            },
+            tags=[args.dataset, 'unified', 'spatial_ode', 'counterfactual'] if config.get('use_counterfactuals') else [args.dataset, 'unified', 'spatial_ode']
         )
-    
-    # Create trainer
-    trainer = UnifiedAdvancedNoMaDTrainer(config)
-    
+        
+        # Define metrics after wandb.init()
+        wandb.define_metric("training/timesteps")
+        wandb.define_metric("episode/*", step_metric="training/timesteps")
+        wandb.define_metric("losses/*", step_metric="training/timesteps")
+        wandb.define_metric("curriculum/*", step_metric="training/timesteps")
+        wandb.define_metric("val/*", step_metric="training/timesteps")
+        
+        # Log initial curriculum info
+        if hasattr(trainer, 'curriculum_manager'):
+            wandb.log({
+                'curriculum/initial_level': trainer.curriculum_manager.current_level,
+                'curriculum/total_levels': len(trainer.curriculum_manager.levels)
+            })
+
     # Load checkpoint if provided
     if args.checkpoint:
         print(f"Loading checkpoint from {args.checkpoint}")

@@ -183,7 +183,7 @@ def main():
     # Analyze distribution
     calculator.analyze_grid_distribution(grid_sizes)
     
-    output_file = os.path.join(args.output_dir, 'scene_grid_sizes.yaml')
+    output_file = os.path.join(args.output_dir, '/home/tuandang/tuandang/quanganh/visualnav-transformer/train/ode/grid/grid.yaml')
     with open(output_file, 'w') as f:
         yaml.dump(grid_sizes, f, default_flow_style=False)
     

@@ -6,17 +6,14 @@ from typing import Dict, List, Tuple, Optional, Any
 from torch.distributions import Categorical
 
 import sys
-sys.path.append(r'D:\NCKH.2025-2026\Navigations\train')
-from arch.nomad import NoMaD_ViNT, replace_bn_with_gn
+sys.path.append(r'/home/tuandang/tuandang/quanganh/visualnav-transformer/train')
+from vint_train.models.nomad.nomad_vint import NoMaD_ViNT, replace_bn_with_gn
 
+sys.path.append(r'/home/tuandang/tuandang/quanganh/visualnav-transformer/train/ode')
 from memory_state import UnifiedSpatialMemoryGraphODE
 from worldModel import CounterfactualWorldModel
 
 class UnifiedAdvancedNoMaDRL(nn.Module):
-    """
-    Advanced NoMaD-RL with Unified Spatial Memory Graph (Neural ODE/PDE)
-    and Counterfactual World Model
-    """
     def __init__(
         self,
         action_dim: int = 4,
@@ -43,8 +40,9 @@ class UnifiedAdvancedNoMaDRL(nn.Module):
             mha_num_attention_layers=mha_num_attention_layers,
             mha_ff_dim_factor=mha_ff_dim_factor,
         )
-        self.vision_encoder = replace_bn_with_gn(self.vision_encoder)
         
+        self._replace_swish_with_relu()
+
         # Unified Spatial Memory Graph with Neural ODE/PDE
         self.spatial_memory_graph = UnifiedSpatialMemoryGraphODE(
             feature_dim=encoding_size,
@@ -63,9 +61,9 @@ class UnifiedAdvancedNoMaDRL(nn.Module):
             )
         
         # Feature fusion w/ unified memory/graph
-        fusion_input_dim = encoding_size * 2  # vision + unified spatial memory
-        if use_counterfactuals:
-            fusion_input_dim += encoding_size  # counterfactual features
+        fusion_input_dim = encoding_size * 3  # vision + unified spatial memory
+        # if use_counterfactuals:
+        #     fusion_input_dim += encoding_size  # counterfactual features
         
         self.feature_fusion = nn.Sequential(
             nn.Linear(fusion_input_dim, hidden_dim),
@@ -88,18 +86,26 @@ class UnifiedAdvancedNoMaDRL(nn.Module):
             nn.Linear(hidden_dim, action_dim)
         )
         
-        # Value network
         self.value_net = nn.Sequential(
             nn.Linear(encoding_size, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.ReLU(),
             nn.Dropout(0.1),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.LayerNorm(hidden_dim // 2),
             nn.ReLU(),
-            nn.Linear(hidden_dim, 1)
+            nn.Linear(hidden_dim // 2, 1),
+            nn.Tanh()  # Output between -1 and 1
         )
-        
+
+        def init_value_weights(m):
+            if isinstance(m, nn.Linear):
+                nn.init.orthogonal_(m.weight, gain=0.1)  # Smaller gain
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0.0)
+
+        self.value_net.apply(init_value_weights)
+
         # Distance prediction (from original NoMaD)
         self.dist_pred_net = nn.Sequential(
             nn.Linear(encoding_size, encoding_size // 4),
@@ -121,6 +127,26 @@ class UnifiedAdvancedNoMaDRL(nn.Module):
             if module.bias is not None:
                 nn.init.constant_(module.bias, 0)
     
+    def _replace_swish_with_relu(self):
+        """Replace Swish activation with ReLU to avoid traceback errors"""
+        import torch.nn as nn
+        
+        def replace_activation(module):
+            for name, child in module.named_children():
+                # Check for various Swish implementations
+                if (hasattr(child, '__class__') and 
+                    ('swish' in child.__class__.__name__.lower() or 
+                    child.__class__.__name__ == 'MemoryEfficientSwish')):
+                    setattr(module, name, nn.ReLU(inplace=True))
+                else:
+                    replace_activation(child)
+        
+        # Replace in both encoders
+        if hasattr(self.vision_encoder, 'obs_encoder'):
+            replace_activation(self.vision_encoder.obs_encoder)
+        if hasattr(self.vision_encoder, 'goal_encoder'):
+            replace_activation(self.vision_encoder.goal_encoder)
+
     def forward(self, observations: Dict[str, torch.Tensor], mode: str = "policy",
                 time_delta: float = 1.0) -> Dict[str, Any]:
         """
@@ -151,11 +177,24 @@ class UnifiedAdvancedNoMaDRL(nn.Module):
             input_goal_mask=goal_mask.long().squeeze(-1)
         )
         
-        # Get goal features if goal-conditioned
-        goal_features = None
-        if (goal_mask < 0.5).any():  # Goal-conditioned episodes
-            goal_features = self.vision_encoder.goal_encoder(goal_img)
+        print(f"Goal mask value: {goal_mask[0].item()}")
+
+        # The condition might be inverted
+        # if (goal_mask < 0.5).any():  # Goal mask = 0 means goal-conditioned
+        #     goal_features = self.vision_encoder.goal_encoder(obsgoal_img)
+        #     print(f"Goal conditioned episode - goal features shape: {goal_features.shape}")
+        # else:
+        #     goal_features = None
+        #     print("Exploration episode - no goal features")
         
+        # In model.py, around line 150:
+        if (goal_mask > 0.5).any():  # goal_mask = 1.0 means NO goal (exploration)
+            goal_features = None
+            print("Exploration episode - no goal features")
+        else:  # goal_mask = 0.0 means goal provided
+            goal_features = self.vision_encoder.goal_encoder(obsgoal_img)
+            print(f"Goal conditioned episode - goal features shape: {goal_features.shape}")
+
         # Unified Spatial Memory Graph with Neural ODE evolution
         spatial_features, spatial_info = self.spatial_memory_graph(
             observation=vision_features,
@@ -166,7 +205,7 @@ class UnifiedAdvancedNoMaDRL(nn.Module):
         
         # Build features list for fusion
         features_to_fuse = [vision_features, spatial_features]
-        
+
         # Counterfactual reasoning
         if self.use_counterfactuals and (mode == "policy" or mode == "all"):
             counterfactuals = self.world_model(vision_features, goal_features)
@@ -176,9 +215,24 @@ class UnifiedAdvancedNoMaDRL(nn.Module):
             features_to_fuse.append(cf_features)
         else:
             counterfactuals = None
-        
+            # Add zero features to maintain consistent input size
+            cf_features = torch.zeros_like(vision_features)
+            features_to_fuse.append(cf_features)
+
+        # Ensure all features have the same number of dimensions
+        normalized_features = []
+        for feat in features_to_fuse:
+            if feat.dim() == 3:
+                feat = feat.squeeze(1)  # Remove middle dimension if present
+            elif feat.dim() == 1:
+                feat = feat.unsqueeze(0)  # Add batch dimension if missing
+            normalized_features.append(feat)
+
+        # Debug: Print feature dimensions
+        # print(f"Feature dimensions: {[f.shape for f in normalized_features]}")
+
         # Fuse all features
-        fused_features = torch.cat(features_to_fuse, dim=-1)
+        fused_features = torch.cat(normalized_features, dim=-1)
         final_features = self.feature_fusion(fused_features)
         
         # Generate outputs based on mode
@@ -195,7 +249,9 @@ class UnifiedAdvancedNoMaDRL(nn.Module):
             results['action_dist'] = Categorical(logits=policy_logits)
 
         if mode == "value" or mode == "all":
-            values = self.value_net(final_features).squeeze(-1)
+            raw_values = self.value_net(final_features).squeeze(-1)
+            # Scale values to reasonable range
+            values = raw_values * 100.0  # Scale tanh output to [-100, 100]
             results['values'] = values
         
         if mode == "distance" or mode == "all":
@@ -211,21 +267,24 @@ class UnifiedAdvancedNoMaDRL(nn.Module):
         """Aggregate counterfactual predictions into features"""
         # Stack counterfactual features
         future_states = torch.stack([cf['future_state'] for cf in counterfactuals], dim=1)
-        collision_probs = torch.stack([cf['collision_prob'] for cf in counterfactuals], dim=1)
-        info_gains = torch.stack([cf['info_gain'] for cf in counterfactuals], dim=1)
-        reachabilities = torch.stack([cf['reachability'] for cf in counterfactuals], dim=1)
+        collision_probs = torch.stack([cf['collision_prob'].squeeze(-1) for cf in counterfactuals], dim=1)
+        info_gains = torch.stack([cf['info_gain'].squeeze(-1) for cf in counterfactuals], dim=1)
+        reachabilities = torch.stack([cf['reachability'].squeeze(-1) for cf in counterfactuals], dim=1)
         
         # Weight future states by safety and information gain
         safety_weights = 1 - collision_probs
         exploration_weights = info_gains / (info_gains.sum(dim=1, keepdim=True) + 1e-8)
         goal_weights = reachabilities
         
-        # Combine weights
         combined_weights = safety_weights + exploration_weights + goal_weights
         combined_weights = F.softmax(combined_weights, dim=1)
         
-        # Weighted average of future states
+        # Weighted average of future states - ensure 2D output
         weighted_future = (future_states * combined_weights.unsqueeze(-1)).sum(dim=1)
+        
+        # Ensure output is 2D [batch_size, feature_dim]
+        if weighted_future.dim() > 2:
+            weighted_future = weighted_future.squeeze()
         
         return weighted_future
     
@@ -273,17 +332,10 @@ class UnifiedAdvancedNoMaDRL(nn.Module):
         self.last_update_time = 0.0
     
     def get_auxiliary_losses(self, batch_data: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        """
-        Compute auxiliary losses for the unified model
-        
-        Args:
-            batch_data: Dictionary containing:
-                - observations: Current observations
-                - next_observations: Next observations
-                - actions: Actions taken
-                - rewards: Rewards received
-        """
         losses = {}
+        
+        # Get current outputs first
+        current_outputs = self.forward(batch_data['observations'], mode="all")
         
         # Counterfactual consistency loss
         if self.use_counterfactuals and 'next_observations' in batch_data:
@@ -292,8 +344,6 @@ class UnifiedAdvancedNoMaDRL(nn.Module):
                 next_outputs = self.forward(batch_data['next_observations'], mode="features")
                 actual_next_features = next_outputs['features']
             
-            # Get predicted features
-            current_outputs = self.forward(batch_data['observations'], mode="all")
             counterfactuals = current_outputs['counterfactuals']
             
             if counterfactuals is not None:
@@ -326,8 +376,10 @@ class UnifiedAdvancedNoMaDRL(nn.Module):
                     smoothness_loss = F.mse_loss(src_features, dst_features)
                     losses['spatial_smoothness_loss'] = smoothness_loss
         
-        return losses
+        if hasattr(self.spatial_memory_graph, 'path_score_regularization'):
+            losses['path_scorer_reg_loss'] = -0.1 * self.spatial_memory_graph.path_score_regularization
 
+        return losses
 
 
 class UnifiedAdvancedTrainingWrapper:
@@ -342,8 +394,16 @@ class UnifiedAdvancedTrainingWrapper:
         
     def reset_episode(self):
         """Reset for new episode"""
-        self.model.reset_memory()
+        # Don't reset the entire graph, just update time
         self.episode_start_time = self.current_time
+        # Optionally reset graph only after many episodes
+        if hasattr(self, 'episode_count'):
+            self.episode_count += 1
+            if self.episode_count % 100 == 0:  # Reset every 100 episodes
+                print(f"Resetting spatial memory graph after {self.episode_count} episodes")
+                self.model.reset_memory()
+        else:
+            self.episode_count = 1
         
     def get_time_delta(self) -> float:
         """Get time delta since last update"""
@@ -386,6 +446,7 @@ class UnifiedAdvancedTrainingWrapper:
         policy_loss = -torch.min(surr1, surr2).mean()
         
         value_loss = F.mse_loss(values, returns)
+        # value_loss = torch.clamp(value_loss, max=100.0)
         entropy_loss = -entropy.mean()
         
         # Auxiliary losses

@@ -54,6 +54,8 @@ class CounterfactualWorldModel(nn.Module):
             nn.Sigmoid()
         )
         
+        self.goal_projection = nn.Linear(1000, feature_dim)
+
     def forward(self, state: torch.Tensor, goal_features: Optional[torch.Tensor] = None) \
                 -> List[Dict[str, torch.Tensor]]:
         """
@@ -83,7 +85,11 @@ class CounterfactualWorldModel(nn.Module):
             
             # Predict goal reachability if goal is provided
             if goal_features is not None:
-                goal_distance_features = torch.cat([future_state, goal_features], dim=-1)
+                # Project goal features to correct dimension
+                if goal_features.dim() > 2:
+                    goal_features = goal_features.squeeze(1)
+                projected_goal_features = self.goal_projection(goal_features)
+                goal_distance_features = torch.cat([future_state, projected_goal_features], dim=-1)
                 reachability = self.reachability_predictor(goal_distance_features)
             else:
                 reachability = torch.zeros(batch_size, 1, device=state.device)

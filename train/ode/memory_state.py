@@ -6,7 +6,6 @@ from typing import Dict, List, Tuple, Optional, Any
 from collections import deque
 import math
 
-# For Neural ODE
 from torchdiffeq import odeint, odeint_adjoint
 
 # For Graph operations
@@ -110,12 +109,16 @@ class SpatialMemoryGraphODE(nn.Module):
         )
         
     def ode_func(self, t: torch.Tensor, state: torch.Tensor, 
-                 laplacian: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
+                laplacian: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
         """
         ODE function defining the dynamics
         dh/dt = f(h, L, context)
         """
         batch_size, num_nodes, feature_dim = state.shape
+        
+        # Ensure context has correct batch dimension
+        if context.dim() == 1:
+            context = context.unsqueeze(0)
         
         # Temporal evolution
         context_expanded = context.unsqueeze(1).expand(-1, num_nodes, -1)
@@ -159,20 +162,24 @@ class SpatialMemoryGraphODE(nn.Module):
                 num_nodes=graph_state.num_nodes
             )
             
-            # Solve ODE
-            time_points = torch.tensor([graph_state.last_update_time, current_time], 
-                                      device=observation.device)
-            
-            evolved_state = odeint(
-                lambda t, h: self.ode_func(t, h, laplacian, context),
-                state,
-                time_points,
-                method='dopri5',
-                rtol=1e-3,
-                atol=1e-4
-            )[-1].squeeze(0)  # Take final time point, remove batch dim
-            
-            graph_state.node_features = evolved_state
+            if current_time > graph_state.last_update_time:
+                time_points = torch.tensor([graph_state.last_update_time, current_time], 
+                                        device=observation.device)
+                
+                context_batched = context.unsqueeze(0) if context.dim() == 1 else context
+                
+                evolved_state = odeint(
+                    lambda t, h: self.ode_func(t, h, laplacian, context_batched),
+                    state,
+                    time_points,
+                    method='dopri5',
+                    rtol=1e-3,
+                    atol=1e-4
+                )[-1].squeeze(0)  # Take final time point, remove batch dim
+                
+                graph_state.node_features = evolved_state.detach().clone()
+            else:
+                evolved_state = graph_state.node_features
         
         # Find or create node for current position
         node_idx = graph_state.find_or_create_node(position, obs_features)
@@ -180,11 +187,13 @@ class SpatialMemoryGraphODE(nn.Module):
         # Information injection at current node
         alpha = 0.7  # injection rate
         if node_idx < graph_state.num_nodes:
-            graph_state.node_features[node_idx] = (
+            # Clone to avoid in-place modification
+            new_features = graph_state.node_features.clone()
+            new_features[node_idx] = (
                 (1 - alpha) * graph_state.node_features[node_idx] + 
                 alpha * obs_features
             )
-        
+            graph_state.node_features = new_features
         # Update edges based on evolved features
         graph_state.update_edges(self.edge_predictor)
         
@@ -199,9 +208,10 @@ class SpatialMemoryGraphODE(nn.Module):
         
         return graph_state, query_features
 
+
 class SpatialMemoryGraphState:
     def __init__(self, feature_dim: int = 256, max_nodes: int = 500, 
-                 distance_threshold: float = 1.0, device: torch.device = None):
+                distance_threshold: float = 1.0, device: torch.device = None):
         self.feature_dim = feature_dim
         self.max_nodes = max_nodes
         self.distance_threshold = distance_threshold
@@ -221,18 +231,23 @@ class SpatialMemoryGraphState:
         self.last_update_time = 0.0
     
     def find_or_create_node(self, position: torch.Tensor, 
-                           features: torch.Tensor) -> int:
+                       features: torch.Tensor) -> int:
         """Find existing node or create new one"""
         if self.num_nodes == 0:
+            print(f"Creating first node at position: {position}")
             return self._add_node(position, features)
         
         # Compute distances to existing nodes
         distances = torch.norm(self.node_positions - position.unsqueeze(0), dim=1)
         min_dist, nearest_idx = distances.min(dim=0)
         
+        # print(f"Min distance to existing nodes: {min_dist.item():.3f}, threshold: {self.distance_threshold}")
+        
         if min_dist < self.distance_threshold:
+            # print(f"Reusing node {nearest_idx.item()}")
             return nearest_idx.item()
         else:
+            print(f"Creating new node, total nodes will be: {self.num_nodes + 1}")
             return self._add_node(position, features)
     
     def _add_node(self, position: torch.Tensor, features: torch.Tensor) -> int:
@@ -389,19 +404,37 @@ class UnifiedSpatialMemoryGraphODE(nn.Module):
         self.path_scorer = nn.Sequential(
             nn.Linear(feature_dim * 2, hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, 1)
+            nn.Linear(hidden_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1),
+            nn.Tanh()  # Output between -1 and 1
         )
+
+        # Better initialization
+        def init_weights(m):
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0.1)
+
+        self.path_scorer.apply(init_weights)
+
+        # with torch.no_grad():
+        #     self.path_scorer[-1].bias.fill_(0.1)  # Small positive bias
         
-        # Initialize graph state
+        self.goal_projection = nn.Linear(1000, feature_dim)
+
         self.graph_state = None
         self.current_time = 0.0
     
     def reset(self):
         """Reset the graph state"""
+        device = next(self.parameters()).device
         self.graph_state = SpatialMemoryGraphState(
             feature_dim=self.feature_dim,
             max_nodes=self.max_nodes,
-            distance_threshold=self.distance_threshold
+            distance_threshold=self.distance_threshold,
+            device=device  # Pass the correct device
         )
         self.current_time = 0.0
     
@@ -429,7 +462,6 @@ class UnifiedSpatialMemoryGraphODE(nn.Module):
             self.reset()
             self.graph_state.device = device
         
-        # Update time
         self.current_time += time_delta
         
         # Process each batch element (usually batch_size=1 for RL)
@@ -471,15 +503,24 @@ class UnifiedSpatialMemoryGraphODE(nn.Module):
                     
                     # Score all nodes for goal similarity
                     goal_scores = []
+                    projected_goal = self.goal_projection(goal_features[b])
+                    
+                    print(f"Goal features shape: {goal_features[b].shape}")
+                    print(f"Projected goal shape: {projected_goal.shape}")
+                    print(f"Number of nodes to score: {self.graph_state.num_nodes}")
+                    
                     for node_feat in self.graph_state.node_features:
-                        score_input = torch.cat([node_feat, goal_features[b]])
+                        score_input = torch.cat([node_feat, projected_goal])
                         score = self.path_scorer(score_input)
                         goal_scores.append(score)
                     
                     if goal_scores:
-                        goal_scores = torch.cat(goal_scores)
+                        goal_scores = torch.stack(goal_scores).squeeze(-1)  # Stack properly
                         path_confidence = goal_scores.max()
-                
+                        print(f"Max path confidence: {path_confidence.item():.4f}")
+
+                        self.path_score_regularization = torch.mean(torch.abs(goal_scores))
+                        
                 info = {
                     'num_nodes': self.graph_state.num_nodes,
                     'num_edges': self.graph_state.edge_index.size(1) // 2,

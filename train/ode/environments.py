@@ -17,8 +17,8 @@ class EnhancedAI2ThorEnv(gym.Env):
         image_size: Tuple[int, int] = (224, 224),
         max_episode_steps: int = 500,
         success_distance: float = 1.0,
-        rotation_step: int = 60,
-        movement_step: float = 0.25,
+        rotation_step: int = 30,
+        movement_step: float = 0.4,
         context_size: int = 5,
         goal_prob: float = 0.5,
     ):
@@ -36,12 +36,11 @@ class EnhancedAI2ThorEnv(gym.Env):
         self.scene_names = scene_names if scene_names else []
         self.ithor_scenes = []
         self.robothor_scenes = []
-        
-        for scene in self.scene_names:
-            if self._is_robothor_scene(scene):
-                self.robothor_scenes.append(scene)
-            else:
-                self.ithor_scenes.append(scene)
+                
+        def _is_robothor_scene(self, scene_name: str) -> bool:
+            if scene_name is None:
+                return False
+            return any(keyword in scene_name for keyword in ['Train', 'Val', 'Test'])
         
         print(f"Environment initialized with {len(self.ithor_scenes)} iTHOR and {len(self.robothor_scenes)} RoboTHOR scenes")
         
@@ -51,7 +50,7 @@ class EnhancedAI2ThorEnv(gym.Env):
         self._initialize_controller()
         
         # Gym spaces
-        self.action_space = spaces.Discrete(4)
+        self.action_space = spaces.Discrete(6)
         self.observation_space = spaces.Dict({
             'rgb': spaces.Box(low=0, high=255, shape=(3, *image_size), dtype=np.uint8),
             'goal_rgb': spaces.Box(low=0, high=255, shape=(3, *image_size), dtype=np.uint8),
@@ -92,8 +91,8 @@ class EnhancedAI2ThorEnv(gym.Env):
             self.controller = Controller(
                 agentMode="locobot",  # RoboTHOR uses locobot
                 scene=scene_name,
-                gridSize=0.25,
-                snapToGrid=True,
+                gridSize=0.4,
+                snapToGrid=False,
                 rotateStepDegrees=self.rotation_step,
                 renderDepthImage=False,
                 renderInstanceSegmentation=False,
@@ -108,7 +107,7 @@ class EnhancedAI2ThorEnv(gym.Env):
                 agentMode="locobot",
                 scene=scene_name,
                 gridSize=0.25,
-                snapToGrid=True,
+                snapToGrid=False,
                 rotateStepDegrees=self.rotation_step,
                 renderDepthImage=False,
                 renderInstanceSegmentation=False,
@@ -157,7 +156,10 @@ class EnhancedAI2ThorEnv(gym.Env):
         else:
             self.goal_position = None
             self.goal_image = None
-        
+
+        print(f"Episode type: {'GOAL' if self.is_goal_conditioned else 'EXPLORATION'}, "
+            f"goal_prob: {self.goal_prob}, random: {random.random()}")
+
         # Get init observation
         obs = self._get_observation()
         
@@ -195,13 +197,23 @@ class EnhancedAI2ThorEnv(gym.Env):
     
     def step(self, action: int) -> Tuple[Dict[str, np.ndarray], float, bool, Dict[str, Any]]:
         action_map = {
-            0: "MoveAhead",
-            1: "MoveBack",
-            2: "RotateLeft",
-            3: "RotateRight",
+            0: {"action": "MoveAhead", "moveMagnitude": 0.5},
+            1: {"action": "MoveBack", "moveMagnitude": 0.5},
+            2: {"action": "RotateLeft", "degrees": 30},   # Smaller rotation
+            3: {"action": "RotateRight", "degrees": 30},
+            4: {"action": "MoveAhead", "moveMagnitude": 1.0},  # Longer step
+            5: {"action": "RotateLeft", "degrees": 60},   # Larger rotation
+            6: {"action": "RotateRight", "degrees": 60},
         }
         
-        event = self.controller.step(action=action_map[action])
+        try:
+            event = self.controller.step(action=action_map[action])
+        except Exception as e:
+            print(f"AI2THOR step failed: {e}")
+            # Return a failed step
+            obs = self._get_observation()
+            return self._format_observation(obs), -1.0, True, {'error': str(e)}
+        
         self.current_step += 1
         
         # Get observation
@@ -214,14 +226,14 @@ class EnhancedAI2ThorEnv(gym.Env):
         
         reward = self._calculate_reward(event, obs)
         done = self._is_done(obs)
-        
+
         info = {
             'success': self._is_success(obs),
             'collision': not event.metadata['lastActionSuccess'],
             'step': self.current_step,
             'goal_conditioned': self.is_goal_conditioned,
             'distance_to_goal': self._distance_to_goal() if self.is_goal_conditioned else 0.0,
-            'scene_type': 'robothor' if self._is_robothor_scene(self.current_scene) else 'ithor'
+            'scene_type': 'robothor' if (self.current_scene and self._is_robothor_scene(self.current_scene)) else 'ithor'
         }
         
         return self._format_observation(obs), reward, done, info
@@ -261,13 +273,25 @@ class EnhancedAI2ThorEnv(gym.Env):
                 axis=0
             )
         
-        return {
-            'rgb': obs['rgb'].astype(np.uint8),
-            'goal_rgb': obs['goal_rgb'].astype(np.uint8),
-            'context': context.astype(np.uint8),
-            'goal_mask': np.array([0.0 if self.is_goal_conditioned else 1.0], dtype=np.float32),
-            'goal_position': self.goal_position if self.goal_position is not None else np.zeros(3, dtype=np.float32),
-        }
+        formatted_obs = {
+                'rgb': obs['rgb'].astype(np.uint8),
+                'goal_rgb': obs['goal_rgb'].astype(np.uint8),
+                'context': context.astype(np.uint8),
+                'goal_mask': np.array([0.0 if self.is_goal_conditioned else 1.0], dtype=np.float32),
+                # 'goal_mask': np.array([1.0 if self.is_goal_conditioned else 0.0], dtype=np.float32),
+                'goal_position': self.goal_position if self.goal_position is not None else np.zeros(3, dtype=np.float32),
+            }
+        
+        if hasattr(self, '_debug_counter'):
+            self._debug_counter += 1
+        else:
+            self._debug_counter = 0
+        
+        if self._debug_counter % 100 == 0:
+            print(f"[ENV] Sending observation - is_goal_conditioned: {self.is_goal_conditioned}, "
+                f"goal_mask: {formatted_obs['goal_mask'][0]}")
+        
+        return formatted_obs
     
     def _set_random_goal(self):
         try:
@@ -306,45 +330,63 @@ class EnhancedAI2ThorEnv(gym.Env):
     
     def _calculate_reward(self, event, obs) -> float:
         reward = 0.0
-        reward -= 0.005  # Step penalty
+        reward -= 0.01  # step penalty
         
+        if self.is_goal_conditioned and self.current_step % 50 == 0:
+            print(f"Goal distance: {self._distance_to_goal():.2f}, "
+                f"Success threshold: {self.success_distance}, "
+                f"Agent pos: {self._get_agent_position()}")
+    
         if self.is_goal_conditioned:
             distance = self._distance_to_goal()
             
+            distance = min(distance, 20.0)
+
+            # Stronger distance-based reward
             if hasattr(self, '_prev_distance_to_goal'):
                 distance_improvement = self._prev_distance_to_goal - distance
-                reward += distance_improvement * 20.0
-            
+                distance_improvement = np.clip(distance_improvement, -0.5, 0.5)
+                reward += distance_improvement * 10.0  # Increased from 20.0
+
+                if abs(reward) > 50:
+                    print(f"Large reward: {reward:.2f}, dist improvement: {distance_improvement:.2f}")
+
+                if self.current_step % 50 == 0:
+                    print(f"Step {self.current_step}: distance={distance:.2f}, improvement={distance_improvement:.2f}, reward={reward:.2f}")
+
             self._prev_distance_to_goal = distance
             
+            # Add intermediate rewards
+            if distance < 3.0:
+                reward += 0.5
+            if distance < 1.5:
+                reward += 1.0
+            
             if distance < self.success_distance:
-                reward += 100.0
-                
+                reward += 50.0  # Reduced further
+                print(f"SUCCESS! Distance: {distance:.2f}")
         else:
             # Exploration mode
             current_pos = self._get_agent_position()
             pos_key = (round(current_pos['x'], 1), round(current_pos['z'], 1))
             
-            # Visitation-based rewards
             visit_count = self.position_visit_counts.get(pos_key, 0)
             if visit_count == 0:
-                reward += 5.0
+                reward += 10.0  # Increased from 5.0
             elif visit_count < 3:
-                reward += 2.0 / visit_count
+                reward += 3.0 / visit_count  # Increased
             
             self.position_visit_counts[pos_key] = visit_count + 1
-            
-            if pos_key not in self.visited_positions:
-                self.visited_positions.add(pos_key)
-            
-            if event.metadata['lastAction'] == 'MoveAhead' and event.metadata['lastActionSuccess']:
-                reward += 0.1
         
         # Collision penalty
         if not event.metadata['lastActionSuccess']:
-            reward -= 1.0
+            reward -= 5.0  # Increased from 1.0
         
-        return reward
+        # Movement bonus to prevent spinning
+        if event.metadata['lastAction'] in ['MoveAhead', 'MoveBack'] and event.metadata['lastActionSuccess']:
+            reward += 0.2
+        
+        return np.clip(reward, -5.0, 5.0)
     
     def _is_done(self, obs) -> bool:
         """Check if episode is done"""
@@ -359,8 +401,13 @@ class EnhancedAI2ThorEnv(gym.Env):
     def _is_success(self, obs) -> bool:
         """Check if episode was successful"""
         if self.is_goal_conditioned:
-            return self._distance_to_goal() < self.success_distance
+            distance = self._distance_to_goal()
+            success = distance < self.success_distance
+            if success:
+                print(f"SUCCESS DETECTED! Distance: {distance:.2f}")
+            return success
         else:
+            # For exploration, success = visiting many positions
             return len(self.visited_positions) > 10
     
     def _distance_to_goal(self) -> float:
@@ -392,14 +439,4 @@ class EnhancedAI2ThorEnv(gym.Env):
             event = self.controller.last_event
             return np.array(event.frame)
         return None
-
-    def seed(self, seed: Optional[int] = None):
-        if seed is not None:
-            random.seed(seed)
-            np.random.seed(seed)
-            if self.controller:
-                self.controller.seed(seed)
-        else:
-            seed = random.randint(0, 2**32 - 1)
-            self.seed(seed)
-        return [seed]
+    
