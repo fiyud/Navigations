@@ -196,6 +196,10 @@ class EnhancedAI2ThorEnv(gym.Env):
         return reachable if reachable else [current_pos]
     
     def step(self, action: int) -> Tuple[Dict[str, np.ndarray], float, bool, Dict[str, Any]]:
+
+        if self.is_goal_conditioned and hasattr(self, 'goal_position'):
+            self._prev_distance_to_goal = self._distance_to_goal()
+
         action_map = {
             0: {"action": "MoveAhead", "moveMagnitude": 0.5},
             1: {"action": "MoveBack", "moveMagnitude": 0.5},
@@ -354,6 +358,21 @@ class EnhancedAI2ThorEnv(gym.Env):
                 if self.current_step % 50 == 0:
                     print(f"Step {self.current_step}: distance={distance:.2f}, improvement={distance_improvement:.2f}, reward={reward:.2f}")
 
+            if not hasattr(self, '_prev_distance_to_goal'):
+                self._prev_distance_to_goal = distance
+                print(f"Initial distance to goal: {distance:.2f}")
+            
+            # Calculate improvement
+            distance_improvement = self._prev_distance_to_goal - distance
+
+            if abs(distance_improvement) > 0.001:  # Avoid floating point issues
+                reward += distance_improvement * 10.0
+                
+            if self.current_step % 50 == 0:
+                print(f"Step {self.current_step}: distance={distance:.2f}, "
+                    f"prev_dist={self._prev_distance_to_goal:.2f}, "
+                    f"improvement={distance_improvement:.2f}, reward={reward:.2f}")
+                
             self._prev_distance_to_goal = distance
             
             # Add intermediate rewards
@@ -372,9 +391,9 @@ class EnhancedAI2ThorEnv(gym.Env):
             
             visit_count = self.position_visit_counts.get(pos_key, 0)
             if visit_count == 0:
-                reward += 10.0  # Increased from 5.0
+                reward += 2.0  # Increased from 5.0
             elif visit_count < 3:
-                reward += 3.0 / visit_count  # Increased
+                reward += 1.0 / visit_count  # Increased
             
             self.position_visit_counts[pos_key] = visit_count + 1
         
@@ -403,6 +422,8 @@ class EnhancedAI2ThorEnv(gym.Env):
         if self.is_goal_conditioned:
             distance = self._distance_to_goal()
             success = distance < self.success_distance
+            if distance < 2.0 and not success:
+                print(f"Near goal but not success: distance={distance:.2f}, threshold={self.success_distance}")
             if success:
                 print(f"SUCCESS DETECTED! Distance: {distance:.2f}")
             return success

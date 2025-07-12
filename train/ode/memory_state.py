@@ -163,6 +163,9 @@ class SpatialMemoryGraphODE(nn.Module):
             )
             
             if current_time > graph_state.last_update_time:
+                import time
+                start_time = time.time()
+
                 time_points = torch.tensor([graph_state.last_update_time, current_time], 
                                         device=observation.device)
                 
@@ -177,6 +180,10 @@ class SpatialMemoryGraphODE(nn.Module):
                     atol=1e-4
                 )[-1].squeeze(0)  # Take final time point, remove batch dim
                 
+                ode_time = time.time() - start_time
+
+                if ode_time > 1.0:
+                    print(f"ODE Solve took {ode_time:.2f}s")
                 graph_state.node_features = evolved_state.detach().clone()
             else:
                 evolved_state = graph_state.node_features
@@ -241,7 +248,7 @@ class SpatialMemoryGraphState:
         distances = torch.norm(self.node_positions - position.unsqueeze(0), dim=1)
         min_dist, nearest_idx = distances.min(dim=0)
         
-        # print(f"Min distance to existing nodes: {min_dist.item():.3f}, threshold: {self.distance_threshold}")
+        print(f"Min distance to existing nodes: {min_dist.item():.3f}, threshold: {self.distance_threshold}")
         
         if min_dist < self.distance_threshold:
             # print(f"Reusing node {nearest_idx.item()}")
@@ -404,13 +411,21 @@ class UnifiedSpatialMemoryGraphODE(nn.Module):
         self.path_scorer = nn.Sequential(
             nn.Linear(feature_dim * 2, hidden_dim),
             nn.ReLU(),
+            nn.Dropout(0.1),  
             nn.Linear(hidden_dim, 64),
             nn.ReLU(),
+            nn.Dropout(0.1),  
             nn.Linear(64, 1),
-            nn.Tanh()  # Output between -1 and 1
+            nn.Tanh()
         )
 
-        # Better initialization
+        # Initialize with smaller weights to prevent saturation
+        for layer in self.path_scorer:
+            if isinstance(layer, nn.Linear):
+                nn.init.xavier_uniform_(layer.weight, gain=0.1)
+                if layer.bias is not None:
+                    nn.init.zeros_(layer.bias)
+
         def init_weights(m):
             if isinstance(m, nn.Linear):
                 nn.init.xavier_uniform_(m.weight)
@@ -520,7 +535,7 @@ class UnifiedSpatialMemoryGraphODE(nn.Module):
                         print(f"Max path confidence: {path_confidence.item():.4f}")
 
                         self.path_score_regularization = torch.mean(torch.abs(goal_scores))
-                        
+
                 info = {
                     'num_nodes': self.graph_state.num_nodes,
                     'num_edges': self.graph_state.edge_index.size(1) // 2,
