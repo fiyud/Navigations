@@ -1,0 +1,86 @@
+dataset: robothor  # 'ithor', 'robothor', or 'combined'
+splits_file: /home/tuandang/tuandang/quanganh/visualnav-transformer/train/config/splits/robothor_splits.yaml # Path to dataset splits
+
+# Environment settings
+image_size: [224, 224]
+max_episode_steps: 1500 # 500
+success_distance: 1.0
+context_size: 5
+goal_prob: 0.8
+eval_goal_prob: 1.0  # Always goal-conditioned for evaluation
+
+# Model Architecture
+encoding_size: 128 # 256
+mha_num_attention_heads: 4
+mha_num_attention_layers: 4
+mha_ff_dim_factor: 4
+hidden_dim: 256 # 512
+
+# Spatial Memory Graph ODE settings
+max_nodes: 250 # 500
+distance_threshold: 2.0
+reset_graph_every_n_episodes: 100  # Don't reset graph every episode
+time_step: 0.1  # Time increment per environment step for ODE
+
+# Counterfactual World Model
+use_counterfactuals: true
+counterfactual_horizon: 6  # How many steps to predict ahead
+
+# Curriculum Learning Settings
+curriculum_type: grid  # 'grid' for grid-based curriculum
+curriculum_window_size: 100
+curriculum_success_threshold: 0.6
+curriculum_min_episodes: 100
+curriculum_update_freq: 10
+grid_size: 5  # For grid-based curriculum
+
+# Training parameters
+total_timesteps: 5000000  # 5M timesteps
+rollout_steps: 2048
+buffer_size: 1024 # 2048
+batch_size: 32 # 64
+ppo_epochs: 10
+learning_rate: 0.0001
+
+gamma: 0.99
+lam: 0.95
+clip_ratio: 0.2
+entropy_coef: 0.05
+value_coef: 0.5
+distance_coef: 0.1
+max_grad_norm: 0.5
+
+# Auxiliary loss coefficients
+counterfactual_coef: 0.1
+spatial_smoothness_coef: 0.05
+
+# Performance optimization
+use_amp: true  # Mixed precision training
+device: cuda
+
+# Evaluation settings
+eval_episodes: 20
+val_freq: 100  # Validate every N updates
+
+log_freq: 10
+save_freq: 50
+save_dir: ./checkpoints/unified_advanced
+
+goal_selection:
+  min_visible_objects: 2          # Minimum objects in view
+  min_object_diversity: 2         # Minimum different object types
+  texture_threshold: 200          # Laplacian variance threshold
+  edge_density_threshold: 0.08    # Edge density threshold
+  color_diversity_threshold: 2.5  # Color entropy threshold
+  contrast_threshold: 30          # Image contrast threshold
+  priority_objects:              # Objects to prioritize
+    - Television
+    - Laptop
+    - Painting
+    - Mirror
+    - Book
+
+# Weights & Biases python3 train.py --config /home/tuandang/tuandang/quanganh/visualnav-transformer/train/config/ode.yaml--dataset robothor > debug.log 2&1
+use_wandb: true
+wandb_project: nomad-rl-unified-advanced
+run_name: unified_spatial_ode_experiment

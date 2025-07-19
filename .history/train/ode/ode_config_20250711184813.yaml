@@ -1,0 +1,76 @@
+# config/unified_advanced.yaml
+
+# Dataset configuration
+dataset: combined  # 'ithor', 'robothor', or 'combined'
+splits_file: ./config/splits/combined_splits.yaml  # Path to dataset splits
+
+# Environment settings
+image_size: [224, 224]
+max_episode_steps: 500
+success_distance: 1.0
+context_size: 5
+goal_prob: 0.5
+eval_goal_prob: 1.0  # Always goal-conditioned for evaluation
+
+# Model Architecture
+encoding_size: 256
+mha_num_attention_heads: 4
+mha_num_attention_layers: 4
+mha_ff_dim_factor: 4
+hidden_dim: 512
+
+# Spatial Memory Graph ODE settings
+max_nodes: 500
+distance_threshold: 1.0
+time_step: 0.1  # Time increment per environment step for ODE
+
+# Counterfactual World Model
+use_counterfactuals: true
+counterfactual_horizon: 5  # How many steps to predict ahead
+
+# Curriculum Learning Settings
+curriculum_type: grid  # 'grid' for grid-based curriculum
+curriculum_window_size: 100
+curriculum_success_threshold: 0.7
+curriculum_min_episodes: 100
+curriculum_update_freq: 10
+grid_size: 5  # For grid-based curriculum
+
+# Training parameters
+total_timesteps: 5000000  # 5M timesteps
+rollout_steps: 2048
+buffer_size: 2048
+batch_size: 64
+ppo_epochs: 10
+learning_rate: 0.0003
+
+# PPO parameters
+gamma: 0.99
+lam: 0.95
+clip_ratio: 0.2
+entropy_coef: 0.01
+value_coef: 0.5
+distance_coef: 0.1
+max_grad_norm: 0.5
+
+# Auxiliary loss coefficients
+counterfactual_coef: 0.1
+spatial_smoothness_coef: 0.05
+
+# Performance optimization
+use_amp: true  # Mixed precision training
+device: cuda
+
+# Evaluation settings
+eval_episodes: 20
+val_freq: 100  # Validate every N updates
+
+# Logging and saving
+log_freq: 10
+save_freq: 50
+save_dir: ./checkpoints/unified_advanced
+
+# Weights & Biases python3 train.py --config /home/tuandang/tuandang/quanganh/visualnav-transformer/train/config/ode.yaml--dataset robothor > lo
+use_wandb: true
+wandb_project: nomad-rl-unified-advanced
+run_name: unified_spatial_ode_experiment

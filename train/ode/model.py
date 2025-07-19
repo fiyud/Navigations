@@ -95,14 +95,18 @@ class UnifiedAdvancedNoMaDRL(nn.Module):
             nn.LayerNorm(hidden_dim // 2),
             nn.ReLU(),
             nn.Linear(hidden_dim // 2, 1),
-            nn.Tanh()  # Output between -1 and 1
+            # nn.Tanh()  # Output between -1 and 1
         )
 
         def init_value_weights(m):
             if isinstance(m, nn.Linear):
-                nn.init.orthogonal_(m.weight, gain=0.1)  # Smaller gain
-                if m.bias is not None:
+                if m.out_features == 1:  # Last layer
+                    nn.init.constant_(m.weight, 0.0)
                     nn.init.constant_(m.bias, 0.0)
+                else:
+                    nn.init.orthogonal_(m.weight, gain=1.0)
+                    if m.bias is not None:
+                        nn.init.constant_(m.bias, 0.0)
 
         self.value_net.apply(init_value_weights)
 
@@ -187,13 +191,32 @@ class UnifiedAdvancedNoMaDRL(nn.Module):
         #     goal_features = None
         #     print("Exploration episode - no goal features")
         
-        # In model.py, around line 150:
-        if (goal_mask > 0.5).any():  # goal_mask = 1.0 means NO goal (exploration)
-            goal_features = None
-            print("Exploration episode - no goal features")
-        else:  # goal_mask = 0.0 means goal provided
-            goal_features = self.vision_encoder.goal_encoder(obsgoal_img)
-            print(f"Goal conditioned episode - goal features shape: {goal_features.shape}")
+ 
+        goal_mask_value = goal_mask[0].item() if goal_mask.numel() > 0 else -1
+        print(f"Goal mask value: {goal_mask_value}, shape: {goal_mask.shape}")
+
+        batch_size = obs_img.size(0)
+        goal_features_list = []
+        
+        for b in range(batch_size):
+            if goal_mask[b].item() < 0.5:  # Goal-conditioned
+                # Extract single sample goal image
+                single_obsgoal = obsgoal_img[b:b+1]
+                single_goal_features = self.vision_encoder.goal_encoder(single_obsgoal)
+                goal_features_list.append(single_goal_features)
+            else:  # Exploration
+                # Use zeros or a learned exploration embedding
+                goal_features_list.append(torch.zeros(1, 1000, device=obs_img.device))
+        
+        # Stack goal features
+        goal_features = torch.cat(goal_features_list, dim=0) if goal_features_list else None
+        
+        # Only print during rollout (batch_size = 1)
+        if batch_size == 1:
+            if goal_mask[0].item() < 0.5:
+                print(f"Goal conditioned episode - goal features shape: {goal_features.shape}")
+            else:
+                print("Exploration episode - no goal features")
 
         # Unified Spatial Memory Graph with Neural ODE evolution
         spatial_features, spatial_info = self.spatial_memory_graph(
@@ -289,9 +312,8 @@ class UnifiedAdvancedNoMaDRL(nn.Module):
         return weighted_future
     
     def get_action(self, observations: Dict[str, torch.Tensor], 
-                   deterministic: bool = False,
-                   time_delta: float = 1.0) -> Tuple[torch.Tensor, torch.Tensor, Dict]:
-        """Get action with additional information"""
+                deterministic: bool = False,
+                time_delta: float = 1.0) -> Tuple[torch.Tensor, torch.Tensor, Dict]:
         with torch.no_grad():
             outputs = self.forward(observations, mode="policy", time_delta=time_delta)
             action_dist = outputs['action_dist']
@@ -299,7 +321,14 @@ class UnifiedAdvancedNoMaDRL(nn.Module):
             if deterministic:
                 action = action_dist.probs.argmax(dim=-1)
             else:
-                action = action_dist.sample()
+                probs = action_dist.probs
+                if outputs.get('spatial_info', {}).get('path_confidence', 1.0).item() < 0.3:
+                    # Boost rotation action probabilities
+                    if probs.shape[-1] >= 4:  # Ensure we have rotation actions
+                        probs[:, 2:4] *= 1.5  # Boost turn left/right
+                        probs = probs / probs.sum(dim=-1, keepdim=True)
+                
+                action = torch.multinomial(probs, 1).squeeze(-1)
             
             log_prob = action_dist.log_prob(action)
             
@@ -380,7 +409,6 @@ class UnifiedAdvancedNoMaDRL(nn.Module):
             losses['path_scorer_reg_loss'] = -0.1 * self.spatial_memory_graph.path_score_regularization
 
         return losses
-
 
 class UnifiedAdvancedTrainingWrapper:
     def __init__(self, model: UnifiedAdvancedNoMaDRL, config: Dict):

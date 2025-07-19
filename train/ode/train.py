@@ -23,12 +23,19 @@ from model import (
     create_unified_model,
     visualize_spatial_memory_graph
 )
-
+# Check cac goc de dua ra quyet dinh, co the dung bell-man equations
 from preprocess.grid_manager import GridBasedCurriculumManager
 from environments import EnhancedAI2ThorEnv
 from nomad_rl.models.nomad_rl_model import prepare_observation, PPOBuffer
 
+import os
+os.environ['QT_QPA_PLATFORM'] = 'offscreen'
+os.environ['DISPLAY'] = ':1.0'  # Change from :0 to :1.0
+import matplotlib
+matplotlib.use('Agg')
+
 torch.autograd.set_detect_anomaly(True)
+
 import torch.fx.traceback as fx_traceback
 fx_traceback.has_preserved_node_meta = lambda: False
 
