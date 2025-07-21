@@ -1,0 +1,106 @@
+dataset: robothor  # 'ithor', 'robothor', or 'combined'
+splits_file: /home/tuandang/tuandang/quanganh/visualnav-transformer/train/config/splits/robothor_splits.yaml
+
+# Environment settings
+image_size: [224, 224]
+max_episode_steps: 1500
+success_distance: 1.0
+context_size: 5
+goal_prob: 0.8
+eval_goal_prob: 1.0
+
+# Model Architecture
+encoding_size: 128
+mha_num_attention_heads: 4
+mha_num_attention_layers: 4
+mha_ff_dim_factor: 4
+hidden_dim: 256  
+action_dim: 6  # Explicit action dimension
+
+# RSSM Settings (from DayDreamer)
+rssm:
+  stoch_size: 32
+  deter_size: 512
+  num_classes: 32
+  kl_balance: 0.8
+  free_nats: 3.0
+
+# Spatial Memory Graph settings
+max_nodes: 500  # Increased from 250
+distance_threshold: 2.0
+reset_graph_every_n_episodes: 100
+time_step: 0.1
+
+pretrain_world_model: true
+pretrain_episodes: 50
+pretrain_batch_size: 32
+pretrain_steps_per_episode: 50
+
+# Imagination Settings (from DayDreamer)
+imagination:
+  horizon: 15
+  num_samples: 10
+  use_for_action_selection: false  # Start with false, enable later
+
+# Parallel Collection
+use_parallel_collection: false  # Start with false for debugging
+num_collectors: 2
+
+# Lambda Returns (from DayDreamer)
+use_lambda_returns: true
+lambda: 0.95
+
+# Training parameters
+total_timesteps: 5000000
+rollout_steps: 2048
+buffer_size: 1024  # Increased from 1024
+batch_size: 32  # Increased from 32
+ppo_epochs: 10
+learning_rate: 0.0003
+
+# PPO parameters
+gamma: 0.99
+lam: 0.95
+clip_ratio: 0.2
+entropy_coef: 0.05
+value_coef: 0.5
+distance_coef: 0.1
+max_grad_norm: 100
+
+# Auxiliary loss coefficients
+counterfactual_coef: 0.1
+spatial_smoothness_coef: 0.05
+reconstruction_coef: 1.0  # For world model
+reward_pred_coef: 1.0
+kl_coef: 0.8  # From DayDreamer
+
+adam_epsilon: 1e-6  # DayDreamer uses 1e-6 instead of default 1e-8
+gradient_clipping: 100
+
+use_amp: true
+device: cuda
+
+eval_episodes: 20
+val_freq: 100
+
+log_freq: 10
+save_freq: 50
+save_dir: ./checkpoints/unified_daydreamer
+
+goal_selection:
+  min_visible_objects: 2
+  min_object_diversity: 2
+  texture_threshold: 200
+  edge_density_threshold: 0.08
+  color_diversity_threshold: 2.5
+  contrast_threshold: 30
+  priority_objects:
+    - Television
+    - Laptop
+    - Painting
+    - Mirror
+    - Book
+
+use_wandb: true
+wandb_project: nomad-rl-unified-advanced
+run_name: unified_daydreamer_experiment

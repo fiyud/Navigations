@@ -1,0 +1,21 @@
+dataset: combined_ithor_robothor
+ithor_room_types:
+- kitchen
+- living_room
+- bedroom
+- bathroom
+seed: 42
+splits:
+  test:
+    ithor: 12
+    robothor: 14
+    total: 26
+  train:
+    ithor: 96
+    robothor: 60
+    total: 156
+  val:
+    ithor: 12
+    robothor: 15
+    total: 27
+total_scenes: 209
