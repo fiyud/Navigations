@@ -9,7 +9,10 @@ from efficientnet_pytorch import EfficientNet
 import sys
 sys.path.append(r'/home/tuandang/tuandang/quanganh/visualnav-transformer/train')
 
-from vint_train.models.nomad.nomad_vint import NoMaD_ViNT, replace_bn_with_gn
+from nomad import NoMaD_ViNT, replace_bn_with_gn
+
+sys.path.append(r'/home/tuandang/tuandang/quanganh/visualnav-transformer/train/gru')
+from model import UnifiedAdvancedTrainingWrapper
 
 class NoMaDRL(nn.Module):
     def __init__(
@@ -219,44 +222,56 @@ class PPOBuffer:
     def get(self) -> Dict[str, torch.Tensor]:
         size = self.size if self.full else self.ptr
         
-        action_indices = self.actions[:size].to(self.device)
-        action_onehot = torch.zeros(size, self.action_space, device=self.device)
-        action_onehot.scatter_(1, action_indices.unsqueeze(1), 1.0)
-
         batch = {
-        'observations': {key: val[:size].to(self.device) for key, val in self.observations.items()},
-        'actions': action_indices,
-        'actions_onehot': action_onehot,
-        'rewards': self.rewards[:size].to(self.device),
-        'values': self.values[:size].to(self.device),
-        'log_probs': self.log_probs[:size].to(self.device),
-        'advantages': self.advantages[:size].to(self.device),
-        'returns': self.returns[:size].to(self.device),
-        'dones': self.dones[:size].to(self.device),
+            'observations': {key: val[:size].to(self.device) for key, val in self.observations.items()},
+            'actions': self.actions[:size].to(self.device),
+            'rewards': self.rewards[:size].to(self.device),
+            'values': self.values[:size].to(self.device),
+            'log_probs': self.log_probs[:size].to(self.device),
+            'advantages': self.advantages[:size].to(self.device),
+            'returns': self.returns[:size].to(self.device),
+            'dones': self.dones[:size].to(self.device),
         }
         
         return batch
     
+    # def compute_gae(self, last_value: float, gamma: float = 0.99, lam: float = 0.95):
+    #     size = self.size if self.full else self.ptr
+        
+    #     advantages = torch.zeros_like(self.rewards[:size])
+    #     last_advantage = 0
+        
+    #     for t in reversed(range(size)):
+    #         if t == size - 1:
+    #             next_value = last_value
+    #             next_non_terminal = 1.0 - self.dones[t].float()
+    #         else:
+    #             next_value = self.values[t + 1]
+    #             next_non_terminal = 1.0 - self.dones[t].float()
+            
+    #         delta = self.rewards[t] + gamma * next_value * next_non_terminal - self.values[t]
+    #         advantages[t] = last_advantage = delta + gamma * lam * next_non_terminal * last_advantage
+        
+    #     self.advantages[:size] = advantages
+    #     self.returns[:size] = advantages + self.values[:size]
+
     def compute_gae(self, last_value: float, gamma: float = 0.99, lam: float = 0.95):
+        """Use lambda returns instead of GAE"""
         size = self.size if self.full else self.ptr
         
-        advantages = torch.zeros_like(self.rewards[:size])
-        last_advantage = 0
+        # Compute lambda returns
+        wrapper = UnifiedAdvancedTrainingWrapper(None, {})  # Temporary
+        self.returns[:size] = wrapper.compute_lambda_returns(
+            rewards=self.rewards[:size],
+            values=self.values[:size],
+            dones=self.dones[:size],
+            last_value=last_value,
+            gamma=gamma,
+            lambda_=lam
+        )
         
-        for t in reversed(range(size)):
-            if t == size - 1:
-                next_value = last_value
-                next_non_terminal = 1.0 - self.dones[t].float()
-            else:
-                next_value = self.values[t + 1]
-                next_non_terminal = 1.0 - self.dones[t].float()
-            
-            delta = self.rewards[t] + gamma * next_value * next_non_terminal - self.values[t]
-            advantages[t] = last_advantage = delta + gamma * lam * next_non_terminal * last_advantage
-        
-        self.advantages[:size] = advantages
-        self.returns[:size] = advantages + self.values[:size]
-        self.returns[:size] = torch.clamp(self.returns[:size], -100, 100)
+        # Advantages are returns - values
+        self.advantages[:size] = self.returns[:size] - self.values[:size]
 
 def prepare_observation(obs: Dict[str, np.ndarray], device: torch.device) -> Dict[str, torch.Tensor]:
     torch_obs = {}
